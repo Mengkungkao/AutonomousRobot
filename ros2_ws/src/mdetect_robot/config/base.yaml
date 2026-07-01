@@ -1,0 +1,22 @@
+mdetect_serial_bridge:
+  ros__parameters:
+    port: /dev/arduino_mdetect
+    baud: 500000
+    cmd_vel_topic: /cmd_vel
+    odom_topic: /odom
+    imu_topic: /imu/data
+    odom_frame: odom
+    base_frame: base_footprint
+    imu_frame: imu_link
+    publish_odom_tf: true
+    command_rate_hz: 20.0
+    max_linear_m_s: 0.25
+    max_angular_rad_s: 2.1
+    wheel_diameter_m: 0.0805
+    counts_per_rev: 4320.0
+
+mdetect_cmd_mux:
+  ros__parameters:
+    front_stop_distance: 0.30
+    front_half_angle_deg: 45.0
+    source_timeout: 0.40

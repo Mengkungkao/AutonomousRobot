@@ -1,0 +1,32 @@
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import SetRemap
+from ament_index_python.packages import get_package_share_directory
+
+
+def generate_launch_description():
+    share = get_package_share_directory('mdetect_robot')
+    nav2 = get_package_share_directory('nav2_bringup')
+    slam = get_package_share_directory('slam_toolbox')
+    params = os.path.join(share, 'config', 'nav2_params.yaml')
+    slam_params = os.path.join(share, 'config', 'slam_toolbox.yaml')
+
+    slam_node = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(slam, 'launch', 'online_async_launch.py')),
+        launch_arguments={'use_sim_time': 'false', 'slam_params_file': slam_params}.items())
+    navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(nav2, 'launch', 'navigation_launch.py')),
+        launch_arguments={'use_sim_time': 'false', 'params_file': params,
+                          'autostart': 'true', 'use_composition': 'False'}.items())
+    rviz = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(nav2, 'launch', 'rviz_launch.py')),
+        launch_arguments={'use_sim_time': 'false'}.items())
+
+    return LaunchDescription([
+        GroupAction([SetRemap(src='/cmd_vel', dst='/cmd_vel_nav'), navigation]),
+        slam_node,
+        rviz,
+    ])

@@ -1,0 +1,11 @@
+coin_d6_lidar:
+  ros__parameters:
+    port: /dev/coin_d6
+    baud: 230400
+    frame_id: laser
+    range_min: 0.05
+    range_max: 8.0
+    angle_increment_deg: 1.0
+    distance_scale: 1.0
+    distance_offset_m: 0.0
+    publish_rate_hz: 10.0

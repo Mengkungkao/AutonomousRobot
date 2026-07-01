@@ -1,0 +1,6 @@
+# Replace the serial values below using:
+#   udevadm info -a -n /dev/ttyACM0 | grep '{serial}' | head -1
+#   udevadm info -a -n /dev/ttyUSB0 | grep '{serial}' | head -1
+# Then copy to /etc/udev/rules.d/99-mdetect-robot.rules and reload udev.
+SUBSYSTEM=="tty", ATTRS{serial}=="ARDUINO_SERIAL_HERE", SYMLINK+="arduino_mdetect", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{serial}=="LIDAR_SERIAL_HERE", SYMLINK+="coin_d6", MODE="0660", GROUP="dialout"
