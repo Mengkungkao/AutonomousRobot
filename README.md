@@ -2,6 +2,17 @@
 
 This project changes the robot from a Pygame waypoint controller into a TurtleBot3-style ROS2 system.
 
+## 0. Get the code
+
+Clone this repository on both the Raspberry Pi and the Ubuntu workstation (or copy it over some other way, e.g. `scp`/USB drive) before running any of the steps below:
+
+```bash
+git clone <this-repository-url> AutonomousRobot
+cd AutonomousRobot
+```
+
+Everything below assumes your current directory is the repository root.
+
 ## 1. System architecture
 
 ```text
@@ -18,8 +29,9 @@ Ubuntu workstation
 Raspberry Pi running Ubuntu Server + ROS2 Humble
   robot_state_publisher
   COIN-D6 -> /scan
-  velocity priority + front obstacle stop gate
-  /cmd_vel -> serial bridge
+  cmd_mux: priority mux over /cmd_vel (Nav2), /cmd_vel_teleop, /cmd_vel_manual,
+           plus a front obstacle stop gate driven by /scan -> /cmd_vel_out
+  serial bridge: /cmd_vel_out -> Arduino
   Arduino telemetry -> /odom, /imu/data, /joint_states and TF
             |
             | USB serial, 500000 baud
@@ -35,6 +47,15 @@ Arduino Uno
 
 SSH is used to open a terminal and manage the Raspberry Pi. ROS2 topics are transported directly by DDS across the network; they are not carried inside the SSH session.
 
+Nav2's `navigation_launch.py` always publishes its final velocity command on the
+plain `/cmd_vel` topic (its internal `velocity_smoother` remap to that name is
+hardcoded and cannot be renamed from an outer launch file without namespacing
+the whole Nav2 stack). Because of that, `cmd_mux` reads `/cmd_vel` directly as
+its Nav2 input and republishes the arbitrated, safety-gated result on
+`/cmd_vel_out`, which is the topic the serial bridge actually subscribes to.
+Manual test commands and teleop are unaffected: they already use
+`/cmd_vel_manual` and `/cmd_vel_teleop` (see section 12).
+
 ## 2. Important coordinate convention
 
 The updated odometry follows ROS conventions:
@@ -47,9 +68,12 @@ The updated odometry follows ROS conventions:
 ## 3. Folder structure
 
 ```text
-arduino/
-  mdetect_ros2_low_level/mdetect_ros2_low_level.ino
-  libraries/                         custom QGPMaker and pin interrupt files
+arduino_ros2_base_controller/
+  arduino_ros2_base_controller.ino   the sketch to upload to the Arduino Uno
+  QGPMaker_MotorShield.*             motor shield driver
+  QGPMaker_Encoder.h                 quadrature encoder driver
+  Adafruit_MS_PWMServoDriver.*       PCA9685 PWM driver used by the shield
+  PinChangeInterrupt*.*              pin-change interrupt library for the encoders
 ros2_ws/src/mdetect_robot/
   mdetect_robot/serial_bridge.py    Arduino <-> ROS2
   mdetect_robot/coin_d6_lidar.py    COIN-D6 -> LaserScan
@@ -58,10 +82,17 @@ ros2_ws/src/mdetect_robot/
   launch/robot.launch.py            Raspberry Pi launch
   launch/desktop_slam.launch.py     RViz + SLAM + Nav2
   launch/desktop_navigation.launch.py saved map + AMCL + Nav2
+  config/base.yaml                  serial bridge and cmd_mux parameters
+  config/lidar.yaml                 COIN-D6 driver parameters
   config/nav2_params.yaml           costmaps, A* and pure pursuit
   config/slam_toolbox.yaml
   config/waypoints.yaml
   urdf/mdetect_robot.urdf.xacro
+scripts/
+  bootstrap_robot_stack.sh          one-shot installer (desktop or pi mode)
+  verify_robot_stack.sh             checks the stack is wired up correctly
+  ros_network_env.sh                source this to set ROS2 DDS network env vars
+  99-mdetect-robot.rules.example    udev rules template for stable serial ports
 ```
 
 ## 4. Arduino serial protocol
@@ -132,11 +163,10 @@ PIDM,4,0.28,0.040,0.003
 
 ## 6. Install the Arduino software
 
-1. Copy the folders under `arduino/libraries/` into the Arduino libraries directory.
-2. Install **MPU6050_tockn** from Arduino Library Manager.
-3. Open `arduino/mdetect_ros2_low_level/mdetect_ros2_low_level.ino`.
-4. Select Arduino Uno and upload.
-5. Keep the robot still during startup IMU calibration.
+1. Install **MPU6050_tockn** from the Arduino Library Manager (Sketch > Include Library > Manage Libraries). The other libraries this sketch needs (QGPMaker motor shield/encoder driver, Adafruit PWM driver, PinChangeInterrupt) are already included as source files inside `arduino_ros2_base_controller/`, so nothing else needs to be installed for those.
+2. Open `arduino_ros2_base_controller/arduino_ros2_base_controller.ino` in the Arduino IDE (opening the `.ino` file also loads the other `.cpp`/`.h` files in the same folder as sketch tabs).
+3. Select Arduino Uno and upload.
+4. Keep the robot still during startup IMU calibration.
 
 The sketch assumes motor order:
 
@@ -149,31 +179,23 @@ M4 rear-left
 
 ## 7. Install ROS2 on the Raspberry Pi
 
-Use Ubuntu Server 22.04 with ROS2 Humble.
+Use Ubuntu Server 22.04 with ROS2 Humble. From the repository root:
 
 ```bash
-cd mdetect_ros2_full_stack
-bash scripts/install_pi_humble.sh
+bash scripts/bootstrap_robot_stack.sh pi
 ```
 
-Copy the ROS2 package into the Pi workspace:
+This single script (safe to re-run) will:
 
-```bash
-mkdir -p ~/ros2_ws/src
-cp -r ros2_ws/src/mdetect_robot ~/ros2_ws/src/
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install
-source install/setup.bash
-```
+- add the ROS2 apt repository and key if they are not already configured
+- install `ros-humble-ros-base`, `robot_state_publisher`, `xacro` and the Python serial/YAML/colcon tooling
+- add your user to the `dialout` group (needed for serial port access)
+- symlink `ros2_ws/src/mdetect_robot` from this repo into `~/ros2_ws/src/`, so future `git pull`s in this repo are picked up without re-copying anything
+- run `rosdep install` and `colcon build --symlink-install`
+- install the udev rules from step 8 automatically, once you have replaced the placeholders in `scripts/99-mdetect-robot.rules.example`
+- append the ROS2 environment (domain ID, `ROS_LOCALHOST_ONLY=0`) to `~/.bashrc`
 
-Add the user to the serial group if the script has not already done it:
-
-```bash
-sudo usermod -aG dialout $USER
-```
-
-Log out and back in after changing groups.
+Log out and back in afterwards so the `dialout` group change takes effect.
 
 ## 8. Stable Arduino and LiDAR port names
 
@@ -185,7 +207,7 @@ udevadm info -a -n /dev/ttyACM0 | grep '{serial}' | head -1
 udevadm info -a -n /dev/ttyUSB0 | grep '{serial}' | head -1
 ```
 
-Edit `scripts/99-mdetect-robot.rules.example`, replace the serial placeholders, and install it:
+Edit `scripts/99-mdetect-robot.rules.example` and replace the two serial placeholders with the real values, then either re-run `bash scripts/bootstrap_robot_stack.sh pi` (it will now install the rule since the placeholders are gone) or install it directly:
 
 ```bash
 sudo cp scripts/99-mdetect-robot.rules.example /etc/udev/rules.d/99-mdetect-robot.rules
@@ -210,17 +232,19 @@ ros2 launch mdetect_robot robot.launch.py \
 
 ## 9. Start the robot-side ROS2 backbone
 
-On the Raspberry Pi:
+`bootstrap_robot_stack.sh` already added ROS2 sourcing and the network env vars to `~/.bashrc`, so a fresh login shell has everything needed. In that shell, on the Raspberry Pi:
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-export ROS_DOMAIN_ID=30
-export ROS_LOCALHOST_ONLY=0
 ros2 launch mdetect_robot robot.launch.py
 ```
 
-Check the topics:
+In a second shell, verify the stack came up correctly:
+
+```bash
+bash scripts/verify_robot_stack.sh
+```
+
+This checks that `mdetect_serial_bridge`, `coin_d6_lidar` and `mdetect_cmd_mux` are running, and that `/odom`, `/imu/data`, `/scan`, `/joint_states`, `/cmd_vel_out` and the `/base/*` services are all present. You can also inspect things manually:
 
 ```bash
 ros2 topic list
@@ -268,17 +292,15 @@ export ROS_DISCOVERY_SERVER=192.168.1.50:11811
 
 ## 11. Install and build on the Ubuntu workstation
 
+From the repository root on the workstation:
+
 ```bash
-bash scripts/install_desktop_humble.sh
-mkdir -p ~/ros2_ws/src
-cp -r ros2_ws/src/mdetect_robot ~/ros2_ws/src/
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install
-source install/setup.bash
-export ROS_DOMAIN_ID=30
-export ROS_LOCALHOST_ONLY=0
+bash scripts/bootstrap_robot_stack.sh desktop
 ```
+
+This installs `ros-humble-desktop`, Nav2, SLAM Toolbox and `teleop_twist_keyboard`, symlinks `ros2_ws/src/mdetect_robot` into `~/ros2_ws/src/`, builds the workspace, and appends the ROS2 environment to `~/.bashrc` (same script as section 7, just with the `desktop` argument). Open a new shell afterwards, or source the two `setup.bash` files it printed at the end.
+
+Run `bash scripts/verify_robot_stack.sh` here too to confirm the package built and (once `robot.launch.py` is running on the Pi) that the robot's topics and services are visible over the network.
 
 ## 12. Manual movement tests
 
@@ -323,6 +345,13 @@ Reset odometry:
 
 ```bash
 ros2 service call /base/reset_odometry std_srvs/srv/Trigger {}
+```
+
+Zero the yaw reference and recalibrate the IMU (keep the robot still for the latter):
+
+```bash
+ros2 service call /base/zero_yaw std_srvs/srv/Trigger {}
+ros2 service call /base/calibrate_imu std_srvs/srv/Trigger {}
 ```
 
 ## 13. Mapping with RViz, SLAM and Nav2

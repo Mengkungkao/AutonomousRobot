@@ -54,7 +54,7 @@ class SerialBridge(Node):
 
         self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('baud', 500000)
-        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel_out')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('imu_topic', '/imu/data')
         self.declare_parameter('odom_frame', 'odom')

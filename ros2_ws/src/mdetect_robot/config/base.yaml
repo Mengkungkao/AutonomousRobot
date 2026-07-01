@@ -2,7 +2,7 @@ mdetect_serial_bridge:
   ros__parameters:
     port: /dev/arduino_mdetect
     baud: 500000
-    cmd_vel_topic: /cmd_vel
+    cmd_vel_topic: /cmd_vel_out
     odom_topic: /odom
     imu_topic: /imu/data
     odom_frame: odom
