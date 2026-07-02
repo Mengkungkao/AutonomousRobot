@@ -50,9 +50,6 @@ if ! command -v apt-get >/dev/null 2>&1; then
   exit 1
 fi
 
-sudo apt-get update
-sudo apt-get install -y software-properties-common curl gnupg lsb-release ca-certificates
-
 EXISTING_ROS_SOURCES="$(grep -rl "packages.ros.org" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)"
 if [ -n "$EXISTING_ROS_SOURCES" ] && ! grep -qx "/etc/apt/sources.list.d/ros2.list" <<<"$EXISTING_ROS_SOURCES"; then
   echo "Found existing packages.ros.org source(s) not managed by this script:" >&2
@@ -60,6 +57,9 @@ if [ -n "$EXISTING_ROS_SOURCES" ] && ! grep -qx "/etc/apt/sources.list.d/ros2.li
   echo "Remove the duplicate(s) before continuing to avoid a Signed-By conflict, then re-run." >&2
   exit 1
 fi
+
+sudo apt-get update
+sudo apt-get install -y software-properties-common curl gnupg lsb-release ca-certificates
 
 if [ ! -f /etc/apt/sources.list.d/ros2.list ]; then
   sudo mkdir -p /usr/share/keyrings
