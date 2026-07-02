@@ -2,13 +2,19 @@
 set -euo pipefail
 
 if [ -f "$HOME/ros2_ws/install/setup.bash" ]; then
+  # ROS 2's generated setup.bash references unset vars like COLCON_TRACE,
+  # which trips `set -u`; relax it just for the sourcing.
+  set +u
   # shellcheck disable=SC1091
   source "$HOME/ros2_ws/install/setup.bash"
+  set -u
 fi
 
 if [ -f /opt/ros/humble/setup.bash ]; then
+  set +u
   # shellcheck disable=SC1091
   source /opt/ros/humble/setup.bash
+  set -u
 fi
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"

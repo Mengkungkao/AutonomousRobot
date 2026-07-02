@@ -225,9 +225,11 @@ Expected device links:
 The launch arguments can be used instead if the links are not configured:
 
 ```bash
+source ~/.bashrc
 ros2 launch mdetect_robot robot.launch.py \
   arduino_port:=/dev/ttyUSB1 \
   lidar_port:=/dev/ttyUSB0
+
 ```
 
 ## 9. Start the robot-side ROS2 backbone
