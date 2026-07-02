@@ -50,21 +50,40 @@ if ! command -v apt-get >/dev/null 2>&1; then
   exit 1
 fi
 
-EXISTING_ROS_SOURCES="$(grep -rl "packages.ros.org" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true)"
-if [ -n "$EXISTING_ROS_SOURCES" ] && ! grep -qx "/etc/apt/sources.list.d/ros2.list" <<<"$EXISTING_ROS_SOURCES"; then
-  echo "Found existing packages.ros.org source(s) not managed by this script:" >&2
-  echo "$EXISTING_ROS_SOURCES" >&2
-  echo "Remove the duplicate(s) before continuing to avoid a Signed-By conflict, then re-run." >&2
+# Legacy migration: this script used to hand-roll the ROS 2 apt source (curl the
+# key to /usr/share/keyrings, write a one-line ros2.list). That conflicts with
+# the official ros2-apt-source package's deb822 ros2.sources file the moment
+# both exist, because apt refuses two different Signed-By values for the same
+# repo. Remove any leftover ros2.list from a previous run of this script before
+# it can conflict with the official source installed below.
+if [ -f /etc/apt/sources.list.d/ros2.list ] && grep -q "packages.ros.org" /etc/apt/sources.list.d/ros2.list 2>/dev/null; then
+  echo "Removing legacy /etc/apt/sources.list.d/ros2.list (superseded by the official ros2-apt-source package)"
+  sudo rm -f /etc/apt/sources.list.d/ros2.list
+  sudo rm -f /usr/share/keyrings/ros-archive-keyring.gpg
+fi
+
+OTHER_ROS_SOURCES="$(grep -rl "packages.ros.org" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -vx "/etc/apt/sources.list.d/ros2.sources" || true)"
+if [ -n "$OTHER_ROS_SOURCES" ]; then
+  echo "Found packages.ros.org source(s) this script does not manage:" >&2
+  echo "$OTHER_ROS_SOURCES" >&2
+  echo "Remove the duplicate(s) to avoid a Signed-By conflict, then re-run." >&2
   exit 1
 fi
 
 sudo apt-get update
-sudo apt-get install -y software-properties-common curl gnupg lsb-release ca-certificates
+sudo apt-get install -y curl ca-certificates
 
-if [ ! -f /etc/apt/sources.list.d/ros2.list ]; then
-  sudo mkdir -p /usr/share/keyrings
-  sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+if [ ! -f /etc/apt/sources.list.d/ros2.sources ]; then
+  ROS_CODENAME="$(. /etc/os-release && echo "$UBUNTU_CODENAME")"
+  ROS_APT_SOURCE_VERSION="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+  if [ -z "$ROS_APT_SOURCE_VERSION" ]; then
+    echo "Could not determine the current ros2-apt-source release from GitHub" >&2
+    exit 1
+  fi
+  ROS_APT_DEB="$(mktemp --suffix=.deb)"
+  curl -fL -o "$ROS_APT_DEB" "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.${ROS_CODENAME}_all.deb"
+  sudo dpkg -i "$ROS_APT_DEB"
+  rm -f "$ROS_APT_DEB"
 fi
 
 sudo apt-get update
@@ -77,9 +96,17 @@ sudo usermod -aG dialout "$USER" >/dev/null 2>&1 || true
 
 mkdir -p "$WORKSPACE_DIR/src"
 if [ -e "$WORKSPACE_DIR/src/mdetect_robot" ] && [ ! -L "$WORKSPACE_DIR/src/mdetect_robot" ]; then
-  echo "WARNING: $WORKSPACE_DIR/src/mdetect_robot already exists and is a real directory," >&2
-  echo "not a symlink back to this repo. It will not be updated by future git pulls." >&2
-  echo "Remove it and re-run this script to link it to $REPO_ROOT/ros2_ws/src/mdetect_robot" >&2
+  # A real (non-symlink) copy here silently shadows this repo: colcon builds
+  # and installs whatever stale launch files/code happen to be in that copy,
+  # `git pull` in the repo never touches it, and `ros2 launch` errors about
+  # missing files that clearly exist in the repo. Move it aside once instead
+  # of leaving the user to debug that mismatch by hand.
+  STALE_BACKUP="$WORKSPACE_DIR/src/mdetect_robot.stale-backup.$(date +%Y%m%d%H%M%S)"
+  echo "WARNING: $WORKSPACE_DIR/src/mdetect_robot is a real directory, not a symlink" >&2
+  echo "back to this repo, so it was going stale. Moving it to $STALE_BACKUP" >&2
+  echo "and linking $WORKSPACE_DIR/src/mdetect_robot -> $REPO_ROOT/ros2_ws/src/mdetect_robot instead." >&2
+  mv "$WORKSPACE_DIR/src/mdetect_robot" "$STALE_BACKUP"
+  ln -s "$REPO_ROOT/ros2_ws/src/mdetect_robot" "$WORKSPACE_DIR/src/mdetect_robot"
 elif [ ! -e "$WORKSPACE_DIR/src/mdetect_robot" ]; then
   ln -s "$REPO_ROOT/ros2_ws/src/mdetect_robot" "$WORKSPACE_DIR/src/mdetect_robot"
 fi

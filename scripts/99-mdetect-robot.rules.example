@@ -1,6 +1,20 @@
-# Replace the serial values below using:
-#   udevadm info -a -n /dev/ttyACM0 | grep '{serial}' | head -1
-#   udevadm info -a -n /dev/ttyUSB0 | grep '{serial}' | head -1
-# Then copy to /etc/udev/rules.d/99-mdetect-robot.rules and reload udev.
-SUBSYSTEM=="tty", ATTRS{serial}=="ARDUINO_SERIAL_HERE", SYMLINK+="arduino_mdetect", MODE="0660", GROUP="dialout"
-SUBSYSTEM=="tty", ATTRS{serial}=="LIDAR_SERIAL_HERE", SYMLINK+="coin_d6", MODE="0660", GROUP="dialout"
+# Both the Arduino and LiDAR on this robot are CH340-based USB-serial adapters
+# (ID_VENDOR_ID=1a86, ID_MODEL_ID=7523) that share one vendor/product ID and have
+# no serial EEPROM, so `udevadm info -a -n /dev/ttyUSBn | grep '{serial}'` comes
+# back identical for both and can't tell them apart. Matching on the physical USB
+# port path (ID_PATH) instead, which is stable as long as each adapter stays
+# plugged into the same physical port:
+#   udevadm info -q property -n /dev/ttyUSBn | grep ID_PATH=   (repeat per node)
+#
+# Current mapping on this robot's Pi:
+#   Arduino -> ttyUSB1 -> platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0
+#   LiDAR   -> ttyUSB0 -> platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0
+#
+# If either adapter gets moved to a different physical USB port, re-run the
+# udevadm command above and update the ID_PATH values below to match.
+#
+# Copy this file to /etc/udev/rules.d/99-mdetect-robot.rules and reload udev
+# (bootstrap_robot_stack.sh pi does this automatically since there is no
+# placeholder text left in this file):
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0", SYMLINK+="arduino_mdetect", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0", SYMLINK+="coin_d6", MODE="0660", GROUP="dialout"

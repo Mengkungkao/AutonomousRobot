@@ -27,6 +27,7 @@ setup(
             'coin_d6_lidar = mdetect_robot.coin_d6_lidar:main',
             'cmd_mux = mdetect_robot.cmd_mux:main',
             'waypoint_cli = mdetect_robot.waypoint_cli:main',
+            'teleop_keyboard = mdetect_robot.teleop_keyboard:main',
         ],
     },
 )

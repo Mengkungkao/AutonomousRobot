@@ -79,6 +79,7 @@ ros2_ws/src/mdetect_robot/
   mdetect_robot/coin_d6_lidar.py    COIN-D6 -> LaserScan
   mdetect_robot/cmd_mux.py          teleop/manual/Nav2 priority and safety gate
   mdetect_robot/waypoint_cli.py     predefined Nav2 routes
+  mdetect_robot/teleop_keyboard.py  WASD keyboard teleop
   launch/robot.launch.py            Raspberry Pi launch
   launch/desktop_slam.launch.py     RViz + SLAM + Nav2
   launch/desktop_navigation.launch.py saved map + AMCL + Nav2
@@ -199,15 +200,24 @@ Log out and back in afterwards so the `dialout` group change takes effect.
 
 ## 8. Stable Arduino and LiDAR port names
 
-Inspect serial device identities:
+Inspect serial device identities (which port is Arduino vs. LiDAR depends on the
+USB-serial chip on your Arduino clone -- boards with a CH340 adapter enumerate as
+`ttyUSB*` rather than `ttyACM*`, so confirm with `ls -l /dev/serial/by-id/` before
+assuming a specific node):
 
 ```bash
 ls -l /dev/serial/by-id/
-udevadm info -a -n /dev/ttyACM0 | grep '{serial}' | head -1
 udevadm info -a -n /dev/ttyUSB0 | grep '{serial}' | head -1
+udevadm info -a -n /dev/ttyUSB1 | grep '{serial}' | head -1
 ```
 
-Edit `scripts/99-mdetect-robot.rules.example` and replace the two serial placeholders with the real values, then either re-run `bash scripts/bootstrap_robot_stack.sh pi` (it will now install the rule since the placeholders are gone) or install it directly:
+On this robot's Pi, the LiDAR is `/dev/ttyUSB0` and the Arduino is `/dev/ttyUSB1`. Both are CH340-based adapters (`ID_VENDOR_ID=1a86`, `ID_MODEL_ID=7523`) that share one vendor/product ID and have no serial EEPROM, so `ATTRS{serial}` comes back identical for both and can't distinguish them. `scripts/99-mdetect-robot.rules.example` already matches on the physical USB port path (`ENV{ID_PATH}`) instead, which is stable as long as each adapter stays in the same USB port; if an adapter moves to a different port, re-run:
+
+```bash
+udevadm info -q property -n /dev/ttyUSBn | grep ID_PATH=
+```
+
+and update the `ID_PATH` values in `scripts/99-mdetect-robot.rules.example` to match, then either re-run `bash scripts/bootstrap_robot_stack.sh pi` (it installs the rule automatically as long as no `_HERE` placeholder remains) or install it directly:
 
 ```bash
 sudo cp scripts/99-mdetect-robot.rules.example /etc/udev/rules.d/99-mdetect-robot.rules
@@ -324,12 +334,16 @@ ros2 topic pub -r 10 /cmd_vel_manual geometry_msgs/msg/Twist \
 
 Stop the publisher with `Ctrl+C`. The source timeout and Arduino watchdog will stop the robot.
 
-Keyboard teleoperation:
+Keyboard teleoperation (WASD, built from this repo's `mdetect_robot` package):
 
 ```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+ros2 run mdetect_robot teleop_keyboard \
   --ros-args --remap cmd_vel:=/cmd_vel_teleop
 ```
+
+Keys: `w`/`s` forward/backward, `a`/`d` rotate left/right, `,`/`.` scale both
+speeds by 10%, `-`/`+` scale linear speed only, `[`/`]` scale angular speed
+only. Any other key stops the robot.
 
 Emergency stop:
 
@@ -458,3 +472,48 @@ A wall directly in front must appear at angle zero in `/scan`. Adjust the `laser
 - The software emergency stop is latched in Arduino and must be explicitly cleared.
 - The LiDAR stop gate stops forward commands inside 300 mm, but it does not replace a certified safety system.
 - Tune the robot footprint, inflation radius and velocity limits before autonomous operation near people.
+
+## 18. Troubleshooting
+
+### `apt update` fails with "Conflicting values set for option Signed-By"
+
+```text
+E: Conflicting values set for option Signed-By regarding source http://packages.ros.org/ros2/ubuntu/ jammy:
+   /usr/share/keyrings/ros-archive-keyring.gpg != -----BEGIN PGP PUBLIC KEY BLOCK-----...
+```
+
+This means two apt source files describe the same `packages.ros.org` repo with two different `Signed-By` values, which apt refuses to reconcile: the official deb822 `/etc/apt/sources.list.d/ros2.sources` file (installed via the `ros2-apt-source` package, key embedded inline) alongside a legacy one-line `/etc/apt/sources.list.d/ros2.list` (points at a separate keyring file). `bootstrap_robot_stack.sh` now installs ROS 2's apt source exclusively via the official `ros2-apt-source` package and removes any leftover `ros2.list` from older runs before it can conflict, so a plain re-run should self-heal this:
+
+```bash
+bash scripts/bootstrap_robot_stack.sh <desktop|pi>
+```
+
+If it still fails, something outside this script wrote a conflicting source file (e.g. manually following ROS's classic install-key instructions, or an old installer from a previous project). Find it and remove it:
+
+```bash
+grep -rl "packages.ros.org" /etc/apt/sources.list /etc/apt/sources.list.d/
+```
+
+Keep `/etc/apt/sources.list.d/ros2.sources` and delete anything else that shows up, then re-run the bootstrap script. Avoid manually pasting the classic curl-key/`ros2.list` install steps from ROS's docs on this machine -- the `ros2-apt-source` package already fully configures the repo, and mixing the two methods is what causes this error.
+
+### `ros2 launch mdetect_robot <file>.launch.py` says the file was not found, even though it exists in this repo
+
+```text
+file 'desktop_slam.launch.py' was not found in the share directory of package 'mdetect_robot'
+```
+
+`$WORKSPACE_DIR/src/mdetect_robot` (`~/ros2_ws/src/mdetect_robot` by default) is supposed to be a symlink to `ros2_ws/src/mdetect_robot` in this repo, so `colcon build` always installs whatever launch files/code are currently in the repo. If that path is instead a real directory -- e.g. from an early manual checkout before this script existed, or from copying the package instead of symlinking it -- `colcon build` keeps building and installing that stale copy, `git pull` in the repo never touches it, and `ros2 launch` fails on launch files that were renamed or added since. Two other symptoms of the same root cause: `ros2 pkg prefix mdetect_robot` fails after `source`-ing your workspace (means the symlink is missing entirely, so the package isn't findable at all), and running an old launch file name (e.g. `workstation_mapping.launch.py`) succeeds while the name documented here does not.
+
+Check whether it's a real directory instead of a symlink:
+
+```bash
+ls -la ~/ros2_ws/src/mdetect_robot
+```
+
+Re-running the bootstrap script now fixes this automatically -- it moves the stale directory aside to `mdetect_robot.stale-backup.<timestamp>`, symlinks the correct path back to this repo, and rebuilds:
+
+```bash
+bash scripts/bootstrap_robot_stack.sh <desktop|pi>
+```
+
+Delete the `.stale-backup.*` directory once you've confirmed the robot still works.
