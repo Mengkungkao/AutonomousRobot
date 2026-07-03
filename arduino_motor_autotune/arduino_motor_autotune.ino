@@ -25,21 +25,37 @@
 
   Commands:
     AUTOTUNE,<motor 1-4>[,<target_mm_s>[,<iterations>]]
-      Runs the autotune search on one motor. Defaults: target_mm_s=200,
+      Runs the single-motor autotune search. Defaults: target_mm_s=200,
       iterations=8. Prints a TRIAL line per step test and a RESULT line
-      with the final gains when done.
+      with the final gains when done. Only the chosen motor moves.
+    MATCH,[<target_mm_s>[,<accel_mm_s2>[,<max_wheel_mm_s>[,<hold_ms>[,<rounds>]]]]]
+      Runs all four motors together through the same commanded ramp-up
+      (at accel_mm_s2 to target_mm_s) then holds for hold_ms, and tunes
+      each motor's gains to minimise its speed-vs-time AND final-distance
+      divergence from the other three -- i.e. matched acceleration, speed,
+      timing and distance, not just an accurate individual step response.
+      Defaults: target_mm_s=100, accel_mm_s2=200, max_wheel_mm_s=300,
+      hold_ms=1000, rounds=6. Seeds from the per-motor gains already found
+      by AUTOTUNE (see MATCH_SEED_GAINS below) rather than starting fresh.
     STOP / ESTOP
-      Aborts any running autotune and releases all motors.
+      Aborts any running autotune/match run and releases all motors.
     PING
       Replies PONG.
 
-  Output after a completed run:
+  Output after a completed AUTOTUNE run:
     RESULT,motor=<n>,kp=...,ki=...,kd=...,cost=...
     PASTE,wheelPID[<index>].configure(kp, ki, kd);
     TEST_CMD,PIDM,<n>,<kp>,<ki>,<kd>
       Send TEST_CMD's payload verbatim to the production firmware's serial
       port to try the gains live (without reflashing) before committing
       them to arduino_ros2_base_controller.ino.
+
+  Output after a completed MATCH run: one RESULT/PASTE/TEST_CMD triple per
+  motor as above, plus:
+    REPORT,max_distance_spread_mm=...
+      Worst-case distance mismatch between any two wheels over the test
+      run -- directly predicts how much the robot will drift off a
+      straight line over that distance.
 */
 
 #include <Wire.h>
@@ -103,6 +119,35 @@ const float MAX_KI = 1.0f;
 const float MAX_KD = 0.05f;
 
 // -----------------------------------------------------------------------------
+// MATCH (group) tuning knobs
+// -----------------------------------------------------------------------------
+
+const float DEFAULT_MATCH_TARGET_MM_S = 100.0f;
+const float DEFAULT_MATCH_ACCEL_MM_S2 = 200.0f;
+const float DEFAULT_MATCH_MAX_WHEEL_MM_S = 300.0f;
+const uint16_t DEFAULT_MATCH_HOLD_MS = 1000;
+const uint8_t DEFAULT_MATCH_ROUNDS = 6;
+const uint8_t MAX_MATCH_ROUNDS_ALLOWED = 15;
+
+// How much a wheel's final cumulative distance is allowed to diverge from
+// the other three's average before it dominates that wheel's cost -- this is
+// the term that actually captures "same distance", since integrated speed
+// error already captures "same acceleration/speed/timing".
+const float MATCH_DISTANCE_WEIGHT = 8.0f;
+
+// Seeded from the results of running AUTOTUNE on each motor individually
+// (2026-07-02), not from scratch -- refines rather than re-discovers.
+const float MATCH_SEED_GAINS[4][3] = {
+  {0.30f, 0.034f, 0.003f},  // motor 1 (front-left)
+  {0.25f, 0.034f, 0.003f},  // motor 2 (front-right)
+  {0.30f, 0.024f, 0.003f},  // motor 3 (rear-right)
+  {0.30f, 0.034f, 0.003f},  // motor 4 (rear-left)
+};
+// Smaller than AUTOTUNE's initial deltas since MATCH is refining an
+// already-decent starting point rather than searching from a blank slate.
+const float MATCH_INITIAL_DELTA[3] = {0.02f, 0.005f, 0.0005f};
+
+// -----------------------------------------------------------------------------
 // Hardware
 // -----------------------------------------------------------------------------
 
@@ -151,8 +196,8 @@ void applyMotorOutputForward(uint8_t index, float magnitudePWM) {
   m->setSpeed(pwm);
 }
 
-float speedFeedForwardPWM(float targetMMs) {
-  float ratio = constrain(targetMMs / MAX_WHEEL_MM_S, 0.0f, 1.0f);
+float speedFeedForwardPWM(float targetMMs, float maxWheelMMs) {
+  float ratio = constrain(targetMMs / maxWheelMMs, 0.0f, 1.0f);
   return MIN_EFFECTIVE_PWM + ratio * (MAX_DRIVE_PWM - MIN_EFFECTIVE_PWM);
 }
 
@@ -161,7 +206,9 @@ float speedFeedForwardPWM(float targetMMs) {
 // AutotuneTypes.h so it's visible to the IDE's auto-generated prototypes)
 // -----------------------------------------------------------------------------
 
-WheelPID testPID;
+// One instance per wheel: AUTOTUNE only ever drives wheelPID[motorIndex]
+// (the other three stay idle); MATCH drives all four simultaneously.
+WheelPID wheelPID[MOTOR_COUNT];
 
 // -----------------------------------------------------------------------------
 // Serial command handling
@@ -207,7 +254,7 @@ bool pollAbort() {
 TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
   TrialResult result = {0.0f, -1.0f, 0.0f, 0.0f, false};
 
-  testPID.reset();
+  wheelPID[motorIndex].reset();
   readEncoderAndResetAtomic(motorIndex);
   float filteredSpeed = 0.0f;
 
@@ -239,8 +286,8 @@ TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
       filteredSpeed += 0.35f * (rawSpeed - filteredSpeed);
 
       const float error = targetMMs - filteredSpeed;
-      const float correction = testPID.update(targetMMs, filteredSpeed, dt);
-      const float feedForward = speedFeedForwardPWM(targetMMs);
+      const float correction = wheelPID[motorIndex].update(targetMMs, filteredSpeed, dt);
+      const float feedForward = speedFeedForwardPWM(targetMMs, MAX_WHEEL_MM_S);
       const float out = constrain(feedForward + correction, 0.0f, 255.0f);
       applyMotorOutputForward(motorIndex, out);
 
@@ -288,7 +335,7 @@ TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
 }
 
 float evaluate(uint8_t motorIndex, float targetMMs, float kp, float ki, float kd, TrialResult *outResult) {
-  testPID.configure(kp, ki, kd);
+  wheelPID[motorIndex].configure(kp, ki, kd);
   TrialResult r = runStepTrial(motorIndex, targetMMs);
   if (outResult) *outResult = r;
   return r.cost;
@@ -421,6 +468,268 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint8_t maxIterations) {
 }
 
 // -----------------------------------------------------------------------------
+// MATCH (group) trial and twiddle search
+//
+// Runs all four wheels together through the same commanded ramp-up/hold
+// profile. Each motor's cost is its divergence -- summed over the whole run,
+// plus a heavily-weighted final-distance term -- from the *other three*
+// wheels' average, not from the commanded target directly. That's what
+// makes this "match the group" instead of "hit my own setpoint".
+// -----------------------------------------------------------------------------
+
+MatchTrialResult runMatchTrial(float targetMMs, float accelMMs2, float maxWheelMMs, uint16_t holdMs) {
+  MatchTrialResult result;
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    result.cost[i] = 0.0f;
+    result.finalDistanceMM[i] = 0.0f;
+  }
+  result.aborted = false;
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    wheelPID[i].reset();
+    readEncoderAndResetAtomic(i);
+  }
+
+  float filteredSpeed[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float distanceMM[MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float rampedTarget = 0.0f;
+
+  const uint32_t rampDurationMs = (accelMMs2 > 0.0f)
+    ? (uint32_t)((targetMMs / accelMMs2) * 1000.0f)
+    : 0;
+  const uint32_t totalDurationMs = rampDurationMs + holdMs;
+
+  const uint32_t start = millis();
+  uint32_t last = start;
+
+  while (millis() - start < totalDurationMs) {
+    if (pollAbort()) {
+      result.aborted = true;
+      break;
+    }
+
+    uint32_t now = millis();
+    if (now - last >= CONTROL_PERIOD_MS) {
+      float dt = (now - last) * 0.001f;
+      last = now;
+      dt = constrain(dt, 0.005f, 0.050f);
+
+      const float maxStep = accelMMs2 * dt;
+      if (rampedTarget < targetMMs) {
+        rampedTarget = min(rampedTarget + maxStep, targetMMs);
+      }
+
+      for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        const int32_t rawTicks = readEncoderAndResetAtomic(i);
+        const float signedTicks = rawTicks * ENCODER_SIGN[i];
+        const float distStep = signedTicks * MM_PER_COUNT;
+        distanceMM[i] += distStep;
+        const float rawSpeed = distStep / dt;
+        filteredSpeed[i] += 0.35f * (rawSpeed - filteredSpeed[i]);
+      }
+
+      const uint32_t elapsedMs = now - start;
+      for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        float sumOthers = 0.0f;
+        for (uint8_t j = 0; j < MOTOR_COUNT; ++j) {
+          if (j != i) sumOthers += filteredSpeed[j];
+        }
+        const float othersMean = sumOthers / (MOTOR_COUNT - 1);
+        const float diff = filteredSpeed[i] - othersMean;
+        result.cost[i] += fabs(diff) * (elapsedMs * 0.001f) * dt;
+      }
+
+      for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        const float correction = wheelPID[i].update(rampedTarget, filteredSpeed[i], dt);
+        const float feedForward = speedFeedForwardPWM(rampedTarget, maxWheelMMs);
+        const float out = constrain(feedForward + correction, 0.0f, 255.0f);
+        applyMotorOutputForward(i, out);
+      }
+    }
+  }
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) applyMotorOutputForward(i, 0.0f);
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    float sumOthersDist = 0.0f;
+    for (uint8_t j = 0; j < MOTOR_COUNT; ++j) {
+      if (j != i) sumOthersDist += distanceMM[j];
+    }
+    const float othersMeanDist = sumOthersDist / (MOTOR_COUNT - 1);
+    result.finalDistanceMM[i] = distanceMM[i];
+    result.cost[i] += MATCH_DISTANCE_WEIGHT * fabs(distanceMM[i] - othersMeanDist);
+  }
+
+  if (!result.aborted) {
+    const uint32_t restStart = millis();
+    while (millis() - restStart < REST_DURATION_MS) {
+      if (pollAbort()) {
+        result.aborted = true;
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+MatchTrialResult runMatchTrialWithParams(float params[4][3], float targetMMs, float accelMMs2,
+                                          float maxWheelMMs, uint16_t holdMs) {
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    wheelPID[i].configure(params[i][0], params[i][1], params[i][2]);
+  }
+  return runMatchTrial(targetMMs, accelMMs2, maxWheelMMs, holdMs);
+}
+
+void printMatchTrial(int round, int motorIndex, const float params[4][3], const MatchTrialResult &r, bool isBaseline) {
+  Serial.print(isBaseline ? F("MBASELINE,") : F("MTRIAL,"));
+  Serial.print(F("round=")); Serial.print(round);
+  Serial.print(F(",motor="));
+  if (motorIndex < 0) Serial.print(F("-"));
+  else Serial.print(motorIndex + 1);
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    Serial.print(F(",kp")); Serial.print(i + 1); Serial.print(F("=")); Serial.print(params[i][0], 4);
+    Serial.print(F(",ki")); Serial.print(i + 1); Serial.print(F("=")); Serial.print(params[i][1], 4);
+    Serial.print(F(",kd")); Serial.print(i + 1); Serial.print(F("=")); Serial.print(params[i][2], 4);
+    Serial.print(F(",cost")); Serial.print(i + 1); Serial.print(F("=")); Serial.print(r.cost[i], 2);
+  }
+  Serial.println();
+}
+
+void runMatchTune(float targetMMs, float accelMMs2, float maxWheelMMs, uint16_t holdMs, uint8_t rounds) {
+  abortRequested = false;
+  releaseAllMotors();
+
+  float params[MOTOR_COUNT][3];
+  float deltas[MOTOR_COUNT][3];
+  float bestCost[MOTOR_COUNT];
+  const float maxParam[3] = {MAX_KP, MAX_KI, MAX_KD};
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    for (uint8_t k = 0; k < 3; ++k) {
+      params[i][k] = MATCH_SEED_GAINS[i][k];
+      deltas[i][k] = MATCH_INITIAL_DELTA[k];
+    }
+  }
+
+  Serial.print(F("INFO,MATCH_START,target_mm_s="));
+  Serial.print(targetMMs, 1);
+  Serial.print(F(",accel_mm_s2="));
+  Serial.print(accelMMs2, 1);
+  Serial.print(F(",max_wheel_mm_s="));
+  Serial.print(maxWheelMMs, 1);
+  Serial.print(F(",hold_ms="));
+  Serial.print(holdMs);
+  Serial.print(F(",rounds="));
+  Serial.println(rounds);
+
+  MatchTrialResult baseline = runMatchTrialWithParams(params, targetMMs, accelMMs2, maxWheelMMs, holdMs);
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) bestCost[i] = baseline.cost[i];
+  printMatchTrial(-1, -1, params, baseline, true);
+  if (baseline.aborted) {
+    finishAborted();
+    return;
+  }
+
+  for (uint8_t round = 0; round < rounds; ++round) {
+    for (uint8_t m = 0; m < MOTOR_COUNT; ++m) {
+      for (uint8_t k = 0; k < 3; ++k) {
+        const float original = params[m][k];
+
+        params[m][k] = constrain(original + deltas[m][k], MIN_GAIN, maxParam[k]);
+        MatchTrialResult trialUp = runMatchTrialWithParams(params, targetMMs, accelMMs2, maxWheelMMs, holdMs);
+        printMatchTrial(round, m, params, trialUp, false);
+        if (trialUp.aborted) {
+          finishAborted();
+          return;
+        }
+
+        if (trialUp.cost[m] < bestCost[m]) {
+          bestCost[m] = trialUp.cost[m];
+          deltas[m][k] *= 1.1f;
+          continue;
+        }
+
+        params[m][k] = constrain(original - deltas[m][k], MIN_GAIN, maxParam[k]);
+        MatchTrialResult trialDown = runMatchTrialWithParams(params, targetMMs, accelMMs2, maxWheelMMs, holdMs);
+        printMatchTrial(round, m, params, trialDown, false);
+        if (trialDown.aborted) {
+          finishAborted();
+          return;
+        }
+
+        if (trialDown.cost[m] < bestCost[m]) {
+          bestCost[m] = trialDown.cost[m];
+          deltas[m][k] *= 1.05f;
+        } else {
+          params[m][k] = original;
+          deltas[m][k] *= 0.9f;
+        }
+      }
+    }
+
+    float deltaSum = 0.0f;
+    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+      for (uint8_t k = 0; k < 3; ++k) deltaSum += deltas[i][k];
+    }
+    if (deltaSum < CONVERGENCE_THRESHOLD * MOTOR_COUNT) {
+      Serial.println(F("INFO,MATCH_CONVERGED_EARLY"));
+      break;
+    }
+  }
+
+  releaseAllMotors();
+
+  // One clean confirmation run at the converged gains, used for the report.
+  MatchTrialResult final = runMatchTrialWithParams(params, targetMMs, accelMMs2, maxWheelMMs, holdMs);
+  releaseAllMotors();
+
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    Serial.print(F("RESULT,motor="));
+    Serial.print(i + 1);
+    Serial.print(F(",kp="));
+    Serial.print(params[i][0], 4);
+    Serial.print(F(",ki="));
+    Serial.print(params[i][1], 4);
+    Serial.print(F(",kd="));
+    Serial.print(params[i][2], 4);
+    Serial.print(F(",cost="));
+    Serial.print(final.cost[i], 3);
+    Serial.print(F(",final_distance_mm="));
+    Serial.println(final.finalDistanceMM[i], 2);
+
+    Serial.print(F("PASTE,wheelPID["));
+    Serial.print(i);
+    Serial.print(F("].configure("));
+    Serial.print(params[i][0], 4);
+    Serial.print(F(", "));
+    Serial.print(params[i][1], 4);
+    Serial.print(F(", "));
+    Serial.print(params[i][2], 4);
+    Serial.println(F(");"));
+
+    Serial.print(F("TEST_CMD,PIDM,"));
+    Serial.print(i + 1);
+    Serial.print(F(","));
+    Serial.print(params[i][0], 4);
+    Serial.print(F(","));
+    Serial.print(params[i][1], 4);
+    Serial.print(F(","));
+    Serial.println(params[i][2], 4);
+  }
+
+  float maxDist = final.finalDistanceMM[0];
+  float minDist = final.finalDistanceMM[0];
+  for (uint8_t i = 1; i < MOTOR_COUNT; ++i) {
+    if (final.finalDistanceMM[i] > maxDist) maxDist = final.finalDistanceMM[i];
+    if (final.finalDistanceMM[i] < minDist) minDist = final.finalDistanceMM[i];
+  }
+  Serial.print(F("REPORT,max_distance_spread_mm="));
+  Serial.println(maxDist - minDist, 2);
+}
+
+// -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
 
@@ -452,6 +761,31 @@ void processCommand(char *line) {
     if (iterations > MAX_ITERATIONS_ALLOWED) iterations = MAX_ITERATIONS_ALLOWED;
 
     runAutotune((uint8_t)(motorNum - 1), targetMMs, (uint8_t)iterations);
+  }
+  else if (strcmp(command, "MATCH") == 0) {
+    char *targetText = strtok_r(NULL, ",", &savePtr);
+    char *accelText = strtok_r(NULL, ",", &savePtr);
+    char *maxWheelText = strtok_r(NULL, ",", &savePtr);
+    char *holdText = strtok_r(NULL, ",", &savePtr);
+    char *roundsText = strtok_r(NULL, ",", &savePtr);
+
+    float maxWheelMMs = maxWheelText ? atof(maxWheelText) : DEFAULT_MATCH_MAX_WHEEL_MM_S;
+    if (maxWheelMMs < 10.0f) maxWheelMMs = DEFAULT_MATCH_MAX_WHEEL_MM_S;
+
+    float targetMMs = targetText ? atof(targetText) : DEFAULT_MATCH_TARGET_MM_S;
+    targetMMs = constrain(fabs(targetMMs), 10.0f, maxWheelMMs);
+
+    float accelMMs2 = accelText ? atof(accelText) : DEFAULT_MATCH_ACCEL_MM_S2;
+    if (accelMMs2 < 10.0f) accelMMs2 = DEFAULT_MATCH_ACCEL_MM_S2;
+
+    uint16_t holdMs = holdText ? (uint16_t)atoi(holdText) : DEFAULT_MATCH_HOLD_MS;
+    if (holdMs < 100) holdMs = DEFAULT_MATCH_HOLD_MS;
+
+    int rounds = roundsText ? atoi(roundsText) : DEFAULT_MATCH_ROUNDS;
+    if (rounds < 1) rounds = DEFAULT_MATCH_ROUNDS;
+    if (rounds > MAX_MATCH_ROUNDS_ALLOWED) rounds = MAX_MATCH_ROUNDS_ALLOWED;
+
+    runMatchTune(targetMMs, accelMMs2, maxWheelMMs, holdMs, (uint8_t)rounds);
   }
   else if (strcmp(command, "STOP") == 0 || strcmp(command, "ESTOP") == 0) {
     releaseAllMotors();
@@ -496,6 +830,12 @@ void setup() {
   motorShield.begin(500);
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) getMotor(i);
   releaseAllMotors();
+
+  // Idle-time default so wheelPID isn't left zero-initialised; AUTOTUNE and
+  // MATCH both reconfigure whichever motors they run before driving them.
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    wheelPID[i].configure(MATCH_SEED_GAINS[i][0], MATCH_SEED_GAINS[i][1], MATCH_SEED_GAINS[i][2]);
+  }
 
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) readEncoderAndResetAtomic(i);
 

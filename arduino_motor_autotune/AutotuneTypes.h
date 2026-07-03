@@ -50,4 +50,13 @@ struct TrialResult {
   bool aborted;
 };
 
+// Result of one joint (all-four-motors-at-once) MATCH trial. Sized with a
+// literal 4 rather than MOTOR_COUNT since this header is included before the
+// .ino defines that constant.
+struct MatchTrialResult {
+  float cost[4];
+  float finalDistanceMM[4];
+  bool aborted;
+};
+
 #endif
