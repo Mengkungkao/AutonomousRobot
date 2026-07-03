@@ -567,9 +567,13 @@ void setup() {
 
   // Same initial PID gains for all wheels. Each motor receives the same speed
   // target for straight motion, while its own PID output corrects speed mismatch.
-  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-    wheelPID[i].configure(0.25f, 0.034f, 0.003f);
-  }
+  // for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+  //   wheelPID[i].configure(0.25f, 0.034f, 0.003f);
+  // }
+  wheelPID[0].configure(0.3420f,0.0290f,0.0035f);
+  wheelPID[1].configure(0.2056f,0.0292f,0.0030f);
+  wheelPID[2].configure(0.2598f,0.0183f,0.0042f);
+  wheelPID[3].configure(0.4543f,0.0603f,0.0035f);
 
   mpu6050.begin();
   Serial.println(F("INFO,KEEP_ROBOT_STILL_IMU_STARTUP_CALIBRATION"));

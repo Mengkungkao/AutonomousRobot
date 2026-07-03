@@ -20,7 +20,7 @@
   Hardware: QGPMaker motor shield + four QGPMaker quadrature encoders.
   No IMU is used by this tool.
 
-  Serial: 500000 baud, 8-N-1. Commands are ASCII lines terminated by
+  Serial: 500000 baud, 8-N-1. Commands are ASCII lines terminated bynow when match autotune, it doesn't have the brake 1s, so the motor 4 is drifts and also motor gear is torque is hard as other 3, let fix that on Arduino code
   \n, \r or ':'.
 
   Commands:
@@ -52,10 +52,14 @@
 
   Output after a completed MATCH run: one RESULT/PASTE/TEST_CMD triple per
   motor as above, plus:
-    REPORT,max_distance_spread_mm=...
-      Worst-case distance mismatch between any two wheels over the test
-      run -- directly predicts how much the robot will drift off a
-      straight line over that distance.
+    REPORT,max_distance_spread_mm=...,expected_distance_mm=...
+      max_distance_spread_mm is the worst-case distance mismatch between any
+      two wheels over the test run -- directly predicts how much the robot
+      will drift off a straight line over that distance. expected_distance_mm
+      is the analytic distance the commanded ramp/hold profile should have
+      produced; compare it against each motor's own final_distance_mm to
+      see whether the group is overshooting/undershooting the actual
+      target, not just agreeing with each other.
 */
 
 #include <Wire.h>
@@ -97,7 +101,11 @@ const uint8_t DEFAULT_ITERATIONS = 8;
 const uint8_t MAX_ITERATIONS_ALLOWED = 30;
 
 const uint16_t TRIAL_DURATION_MS = 1200;
-const uint16_t REST_DURATION_MS = 600;
+// Active brake hold between trials, not a coast -- a released, higher-torque
+// motor (e.g. motor 4's harder gearing) keeps drifting for longer than the
+// others after RELEASE, so trials could start from inconsistent, still-moving
+// wheels. Braking for a full second forces every motor to a real stop first.
+const uint16_t REST_DURATION_MS = 1000;
 const float STEADY_WINDOW_FRACTION = 0.3f;    // last 30% of trial used for steady-state avg
 
 const float OVERSHOOT_COST_WEIGHT = 4.0f;
@@ -134,6 +142,13 @@ const uint8_t MAX_MATCH_ROUNDS_ALLOWED = 15;
 // the term that actually captures "same distance", since integrated speed
 // error already captures "same acceleration/speed/timing".
 const float MATCH_DISTANCE_WEIGHT = 8.0f;
+
+// Anchors the group to the actual commanded ramp/hold profile, not just to
+// each other. Without these, four wheels overshooting the target by roughly
+// the same amount score just as well as four wheels tracking it accurately
+// -- the search has no reason to prefer "right" over "wrong but agreeing".
+const float MATCH_ABSOLUTE_TICK_WEIGHT = 1.0f;
+const float MATCH_ABSOLUTE_DISTANCE_WEIGHT = 8.0f;
 
 // Seeded from the results of running AUTOTUNE on each motor individually
 // (2026-07-02), not from scratch -- refines rather than re-discovers.
@@ -180,6 +195,20 @@ void releaseAllMotors() {
     m->setSpeed(0);
     m->run(RELEASE);
   }
+}
+
+// Active brake (shorts the H-bridge outputs) rather than RELEASE (coast).
+// Used between trials so a higher-torque wheel can't keep drifting after
+// its target drops to zero -- RELEASE alone lets it coast for longer than
+// the other three, leaving trials starting from inconsistent wheel speeds.
+void brakeMotor(uint8_t index) {
+  QGPMaker_DCMotor *m = getMotor(index);
+  m->setSpeed(0);
+  m->run(BRAKE);
+}
+
+void brakeAllMotors() {
+  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) brakeMotor(i);
 }
 
 // Autotune only ever drives a wheel forward -- direction sign isn't part of
@@ -307,7 +336,7 @@ TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
     }
   }
 
-  applyMotorOutputForward(motorIndex, 0.0f);
+  brakeMotor(motorIndex);
 
   result.overshootPct = (peak > targetMMs) ? ((peak - targetMMs) / targetMMs * 100.0f) : 0.0f;
   if (steadyCount > 0) {
@@ -499,6 +528,11 @@ MatchTrialResult runMatchTrial(float targetMMs, float accelMMs2, float maxWheelM
     : 0;
   const uint32_t totalDurationMs = rampDurationMs + holdMs;
 
+  // Analytic ground truth for the commanded profile: area under the ramp
+  // (a triangle, 0 to targetMMs) plus the hold at full target speed.
+  const float expectedDistanceMM =
+    0.5f * targetMMs * (rampDurationMs * 0.001f) + targetMMs * (holdMs * 0.001f);
+
   const uint32_t start = millis();
   uint32_t last = start;
 
@@ -537,6 +571,10 @@ MatchTrialResult runMatchTrial(float targetMMs, float accelMMs2, float maxWheelM
         const float othersMean = sumOthers / (MOTOR_COUNT - 1);
         const float diff = filteredSpeed[i] - othersMean;
         result.cost[i] += fabs(diff) * (elapsedMs * 0.001f) * dt;
+
+        // Pulls toward the actual commanded ramp, so the group can't drift
+        // to a mutually-agreeing but wrong speed.
+        result.cost[i] += MATCH_ABSOLUTE_TICK_WEIGHT * fabs(filteredSpeed[i] - rampedTarget) * dt;
       }
 
       for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
@@ -548,7 +586,7 @@ MatchTrialResult runMatchTrial(float targetMMs, float accelMMs2, float maxWheelM
     }
   }
 
-  for (uint8_t i = 0; i < MOTOR_COUNT; ++i) applyMotorOutputForward(i, 0.0f);
+  brakeAllMotors();
 
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     float sumOthersDist = 0.0f;
@@ -558,6 +596,7 @@ MatchTrialResult runMatchTrial(float targetMMs, float accelMMs2, float maxWheelM
     const float othersMeanDist = sumOthersDist / (MOTOR_COUNT - 1);
     result.finalDistanceMM[i] = distanceMM[i];
     result.cost[i] += MATCH_DISTANCE_WEIGHT * fabs(distanceMM[i] - othersMeanDist);
+    result.cost[i] += MATCH_ABSOLUTE_DISTANCE_WEIGHT * fabs(distanceMM[i] - expectedDistanceMM);
   }
 
   if (!result.aborted) {
@@ -725,8 +764,16 @@ void runMatchTune(float targetMMs, float accelMMs2, float maxWheelMMs, uint16_t 
     if (final.finalDistanceMM[i] > maxDist) maxDist = final.finalDistanceMM[i];
     if (final.finalDistanceMM[i] < minDist) minDist = final.finalDistanceMM[i];
   }
+  const uint32_t rampDurationMs = (accelMMs2 > 0.0f)
+    ? (uint32_t)((targetMMs / accelMMs2) * 1000.0f)
+    : 0;
+  const float expectedDistanceMM =
+    0.5f * targetMMs * (rampDurationMs * 0.001f) + targetMMs * (holdMs * 0.001f);
+
   Serial.print(F("REPORT,max_distance_spread_mm="));
-  Serial.println(maxDist - minDist, 2);
+  Serial.print(maxDist - minDist, 2);
+  Serial.print(F(",expected_distance_mm="));
+  Serial.println(expectedDistanceMM, 2);
 }
 
 // -----------------------------------------------------------------------------
