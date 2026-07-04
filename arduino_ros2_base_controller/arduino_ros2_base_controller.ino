@@ -91,9 +91,9 @@ const float MM_PER_COUNT[MOTOR_COUNT] = {
 const float TRACK_WIDTH_MM = 210.0f;        // left-to-right wheel centre distance
 
 // Limits should stay conservative until the robot has been tested on blocks.
-const float MAX_LINEAR_MM_S = 200.0f;
+const float MAX_LINEAR_MM_S = 250.0f;
 const float MAX_ANGULAR_DEG_S = 120.0f;
-const float MAX_WHEEL_MM_S = 200.0f;
+const float MAX_WHEEL_MM_S = 250.0f;
 const float LINEAR_ACCEL_MM_S2 = 150.0f;
 const float ANGULAR_ACCEL_DEG_S2 = 120.0f;
 
