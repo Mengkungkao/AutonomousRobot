@@ -28,9 +28,7 @@ d : rotate right
 
 anything else : stop
 
-,/. : increase/decrease max speeds by 10%
--/+ : increase/decrease only linear speed by 10%
-[/] : increase/decrease only angular speed by 10%
+Speed is fixed to the 'speed' and 'turn' parameters.
 
 CTRL-C to quit
 """
@@ -40,15 +38,6 @@ moveBindings = {
     's': (-1, 0, 0, 0),
     'a': (0, 0, 0, 1),
     'd': (0, 0, 0, -1),
-}
-
-speedBindings = {
-    ',': (1.1, 1.1),
-    '.': (.9, .9),
-    '-': (.9, 1),
-    '+': (1.1, 1),
-    '[': (1, .9),
-    ']': (1, 1.1),
 }
 
 
@@ -102,7 +91,11 @@ def main():
     else:
         TwistMsg = geometry_msgs.msg.Twist
 
-    pub = node.create_publisher(TwistMsg, 'cmd_vel', 10)
+    # Publish straight to the mux's dedicated teleop input. Publishing on
+    # 'cmd_vel' (the old default) put keyboard commands on the same topic
+    # Nav2 uses, so Nav2's own rotation commands could immediately override
+    # a/d keypresses and spin the robot the wrong way.
+    pub = node.create_publisher(TwistMsg, 'cmd_vel_teleop', 10)
 
     spinner = threading.Thread(target=rclpy.spin, args=(node,))
     spinner.start()
@@ -110,7 +103,6 @@ def main():
     x = 0.0
     z = 0.0
     th = 0.0
-    status = 0.0
 
     twist_msg = TwistMsg()
 
@@ -126,22 +118,17 @@ def main():
         print(vels(speed, turn))
         while True:
             key = getKey(settings)
+            if key == '\x03':
+                break
+            # Accept the WSAD keys regardless of Shift/Caps Lock so 'A'/'D'
+            # never fall through to the stop branch.
+            key = key.lower()
             if key in moveBindings.keys():
                 x = moveBindings[key][0]
                 th = moveBindings[key][3]
-            elif key in speedBindings.keys():
-                speed = speed * speedBindings[key][0]
-                turn = turn * speedBindings[key][1]
-
-                print(vels(speed, turn))
-                if (status == 14):
-                    print(msg)
-                status = (status + 1) % 15
             else:
                 x = 0.0
                 th = 0.0
-                if (key == '\x03'):
-                    break
 
             if stamped:
                 twist_msg.header.stamp = node.get_clock().now().to_msg()

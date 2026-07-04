@@ -340,13 +340,14 @@ Stop the publisher with `Ctrl+C`. The source timeout and Arduino watchdog will s
 Keyboard teleoperation (WASD, built from this repo's `mdetect_robot` package):
 
 ```bash
-ros2 run mdetect_robot teleop_keyboard \
-  --ros-args --remap cmd_vel:=/cmd_vel_teleop
+ros2 run mdetect_robot teleop_keyboard
 ```
 
-Keys: `w`/`s` forward/backward, `a`/`d` rotate left/right, `,`/`.` scale both
-speeds by 10%, `-`/`+` scale linear speed only, `[`/`]` scale angular speed
-only. Any other key stops the robot.
+Keys: `w`/`s` forward/backward, `a`/`d` rotate left/right. Any other key stops
+the robot. Speed is fixed to the base values (`speed` and `turn` parameters,
+0.5 m/s and 1.0 rad/s by default). The node publishes directly to
+`/cmd_vel_teleop`, the mux's highest-priority input, so no topic remap is
+needed and keyboard commands can't be overridden by Nav2 output on `/cmd_vel`.
 
 Emergency stop:
 
