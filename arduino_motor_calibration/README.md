@@ -40,7 +40,7 @@ predicts for that PWM, so any remaining gap -- e.g. from the real response
 saturating at high PWM, which a straight-line fit doesn't capture -- is
 visible directly.
 
-Defaults: `pwm_step=20`, `hold_ms=1000`. Only the chosen motor moves.
+Defaults: `pwm_step=10`, `hold_ms=1000`. Only the chosen motor moves.
 
 Output per step:
 
