@@ -74,6 +74,9 @@ arduino_ros2_base_controller/
   QGPMaker_Encoder.h                 quadrature encoder driver
   Adafruit_MS_PWMServoDriver.*       PCA9685 PWM driver used by the shield
   PinChangeInterrupt*.*              pin-change interrupt library for the encoders
+arduino_motor_calibration/
+  arduino_motor_calibration.ino      standalone sketch: CALIBRATE + OPENLOOP raw
+                                      per-motor data, see arduino_motor_calibration/README.md
 ros2_ws/src/mdetect_robot/
   mdetect_robot/serial_bridge.py    Arduino <-> ROS2
   mdetect_robot/coin_d6_lidar.py    COIN-D6 -> LaserScan
