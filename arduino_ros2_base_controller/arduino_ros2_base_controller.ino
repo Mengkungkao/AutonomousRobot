@@ -37,9 +37,12 @@
     RESET_ODOM
     ZERO_YAW
     CAL_IMU
-    PID,<kp>,<ki>,<kd>
-    PIDM,<motor_1_to_4>,<kp>,<ki>,<kd>
+    PID,<kp>,<ki>,<kd>[,<lambda>,<mu>]
+    PIDM,<motor_1_to_4>,<kp>,<ki>,<kd>[,<lambda>,<mu>]
     PING
+
+  Wheel speed loops are fractional-order PID (PI^lambda D^mu). lambda/mu
+  default to 1.0 (classic PID) when omitted from PID/PIDM.
 
   Telemetry at 20 Hz:
     T,time_ms,x_mm,y_mm,yaw_deg,vx_mm_s,wz_deg_s,
@@ -69,16 +72,30 @@ const uint16_t COMMAND_WATCHDOG_MS = 500;   // stop if Pi heartbeat disappears
 
 const float WHEEL_DIAMETER_MM = 80.5f;
 const float WHEEL_RADIUS_MM = WHEEL_DIAMETER_MM * 0.5f;
-const float COUNTS_PER_REV = 4320.0f;
-const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
+
+// Measured by hand-rotating each wheel exactly one full turn and reading the
+// tick count (2026-07-02): 4326, 4226, 4138, 4334 -- motors 2 and 3 undercount
+// noticeably relative to the nominal 4320, which (uncorrected) made their
+// measured speed under-report their true speed, so PID kept driving them
+// physically faster than commanded to compensate. Per-wheel values here
+// instead of a single shared constant fix that at the source.
+//by hand 1st time :4326.0f, 4226.0f, 4138.0f, 4334.0f
+//by hand 2nd time : 4193.0f, 4176.0f, 4119.0f, 4330.0f
+const float MEASURED_COUNTS_PER_REV[MOTOR_COUNT] = {4193.0f, 4176.0f, 4119.0f, 4330.0f};
+const float MM_PER_COUNT[MOTOR_COUNT] = {
+  (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[0],
+  (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[1],
+  (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[2],
+  (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[3],
+};
 const float TRACK_WIDTH_MM = 210.0f;        // left-to-right wheel centre distance
 
 // Limits should stay conservative until the robot has been tested on blocks.
-const float MAX_LINEAR_MM_S = 250.0f;
+const float MAX_LINEAR_MM_S = 200.0f;
 const float MAX_ANGULAR_DEG_S = 120.0f;
-const float MAX_WHEEL_MM_S = 350.0f;
-const float LINEAR_ACCEL_MM_S2 = 350.0f;
-const float ANGULAR_ACCEL_DEG_S2 = 220.0f;
+const float MAX_WHEEL_MM_S = 200.0f;
+const float LINEAR_ACCEL_MM_S2 = 150.0f;
+const float ANGULAR_ACCEL_DEG_S2 = 120.0f;
 
 const uint8_t MIN_EFFECTIVE_PWM = 48;
 const uint8_t MAX_DRIVE_PWM = 210;
@@ -115,43 +132,85 @@ MPU6050 mpu6050(Wire);
 // PID controller
 // -----------------------------------------------------------------------------
 
+// Fractional-order PID: PI^lambda D^mu. The integral and derivative each keep
+// their classic, unbounded/instantaneous form -- that's what gives a true
+// pole at the origin, so a constant wheel-speed error still gets integrated
+// away to zero over time, the same guarantee the original classic PID gave.
+// The fractional order only reshapes what feeds them: the error is passed
+// through a Grunwald-Letnikov (GL) short-memory filter of the *residual*
+// order (lambda-1) before the integral, and (mu-1) before the derivative.
+// Both residual orders are small (lambda/mu are kept within [0.4, 1.4], see
+// MIN/MAX_LAMBDA/MU in arduino_motor_autotune.ino) so short-memory
+// truncation only affects fine shaping, never whether steady-state error
+// converges to zero. At lambda == mu == 1.0 the GL filter is exactly the
+// identity (order-0 GL binomial coefficients are 1,0,0,...), so this
+// reduces byte-for-byte to the original classic PID. Identical shape to
+// arduino_motor_autotune's WheelPID (in AutotuneTypes.h) so autotune
+// results transfer directly.
 struct WheelPID {
+  static const uint8_t GL_MEMORY_LENGTH = 20;
+
   float kp;
   float ki;
   float kd;
+  float lambda;
+  float mu;
   float integral;
-  float previousError;
+  float previousShapedError;
   float previousTarget;
+  float errorHistory[GL_MEMORY_LENGTH];  // errorHistory[0] is the newest sample
+  uint8_t historyLen;
 
-  void configure(float p, float i, float d) {
+  void configure(float p, float i, float d, float lam, float m) {
     kp = p;
     ki = i;
     kd = d;
+    lambda = lam;
+    mu = m;
     reset();
   }
 
   void reset() {
     integral = 0.0f;
-    previousError = 0.0f;
+    previousShapedError = 0.0f;
     previousTarget = 0.0f;
+    for (uint8_t j = 0; j < GL_MEMORY_LENGTH; ++j) errorHistory[j] = 0.0f;
+    historyLen = 0;
+  }
+
+  // GL binomial coefficient recursion: c0 = 1, cj = c(j-1) * (1 - (alpha+1)/j).
+  // dtScale converts the unitless GL sum to physical units (dt^alpha).
+  float glShape(float alpha, float dtScale) const {
+    float coeff = 1.0f;
+    float sum = errorHistory[0];
+    for (uint8_t j = 1; j < historyLen; ++j) {
+      coeff *= (1.0f - (alpha + 1.0f) / (float)j);
+      sum += coeff * errorHistory[j];
+    }
+    return sum * dtScale;
   }
 
   float update(float target, float measured, float dt) {
     if (dt <= 0.0f) return 0.0f;
 
-    // Clear accumulated integral when stopped or when wheel direction changes.
+    // Clear accumulated state when stopped or when wheel direction changes.
     if (fabs(target) < 1.0f || (target * previousTarget < 0.0f)) {
-      integral = 0.0f;
-      previousError = 0.0f;
+      reset();
     }
+    previousTarget = target;
 
     const float error = target - measured;
-    integral += error * dt;
+    for (uint8_t j = GL_MEMORY_LENGTH - 1; j > 0; --j) errorHistory[j] = errorHistory[j - 1];
+    errorHistory[0] = error;
+    if (historyLen < GL_MEMORY_LENGTH) ++historyLen;
+
+    const float shapedForIntegral = glShape(lambda - 1.0f, pow(dt, 1.0f - lambda));
+    integral += shapedForIntegral * dt;
     integral = constrain(integral, -500.0f, 500.0f);
 
-    const float derivative = (error - previousError) / dt;
-    previousError = error;
-    previousTarget = target;
+    const float shapedForDerivative = glShape(mu - 1.0f, pow(dt, 1.0f - mu));
+    const float derivative = (shapedForDerivative - previousShapedError) / dt;
+    previousShapedError = shapedForDerivative;
 
     return kp * error + ki * integral + kd * derivative;
   }
@@ -399,11 +458,15 @@ void processCommand(char *line) {
     char *pText = strtok_r(NULL, ",", &savePtr);
     char *iText = strtok_r(NULL, ",", &savePtr);
     char *dText = strtok_r(NULL, ",", &savePtr);
+    char *lamText = strtok_r(NULL, ",", &savePtr);
+    char *muText = strtok_r(NULL, ",", &savePtr);
     if (pText && iText && dText) {
       const float kp = atof(pText);
       const float ki = atof(iText);
       const float kd = atof(dText);
-      for (uint8_t i = 0; i < MOTOR_COUNT; ++i) wheelPID[i].configure(kp, ki, kd);
+      const float lambda = lamText ? atof(lamText) : 1.0f;
+      const float mu = muText ? atof(muText) : 1.0f;
+      for (uint8_t i = 0; i < MOTOR_COUNT; ++i) wheelPID[i].configure(kp, ki, kd, lambda, mu);
       Serial.println(F("ACK,PID_ALL"));
     } else {
       Serial.println(F("ERR,PID_FORMAT"));
@@ -414,9 +477,13 @@ void processCommand(char *line) {
     char *pText = strtok_r(NULL, ",", &savePtr);
     char *iText = strtok_r(NULL, ",", &savePtr);
     char *dText = strtok_r(NULL, ",", &savePtr);
+    char *lamText = strtok_r(NULL, ",", &savePtr);
+    char *muText = strtok_r(NULL, ",", &savePtr);
     int motorIndex = motorText ? atoi(motorText) - 1 : -1;
     if (motorIndex >= 0 && motorIndex < MOTOR_COUNT && pText && iText && dText) {
-      wheelPID[motorIndex].configure(atof(pText), atof(iText), atof(dText));
+      const float lambda = lamText ? atof(lamText) : 1.0f;
+      const float mu = muText ? atof(muText) : 1.0f;
+      wheelPID[motorIndex].configure(atof(pText), atof(iText), atof(dText), lambda, mu);
       Serial.println(F("ACK,PID_MOTOR"));
     } else {
       Serial.println(F("ERR,PIDM_FORMAT"));
@@ -496,7 +563,7 @@ void updateControl(float dt) {
     const int32_t signedTicks = rawTicks * ENCODER_SIGN[i];
     cumulativeTicks[i] += signedTicks;
 
-    const float distanceMM = signedTicks * MM_PER_COUNT;
+    const float distanceMM = signedTicks * MM_PER_COUNT[i];
     const float rawSpeedMMs = distanceMM / dt;
 
     // Low-pass encoder speed while preserving signed direction.
@@ -568,12 +635,14 @@ void setup() {
   // Same initial PID gains for all wheels. Each motor receives the same speed
   // target for straight motion, while its own PID output corrects speed mismatch.
   // for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-  //   wheelPID[i].configure(0.25f, 0.034f, 0.003f);
+  //   wheelPID[i].configure(0.25f, 0.034f, 0.003f, 1.0f, 1.0f);
   // }
-  wheelPID[0].configure(0.3420f,0.0290f,0.0035f);
-  wheelPID[1].configure(0.2056f,0.0292f,0.0030f);
-  wheelPID[2].configure(0.2598f,0.0183f,0.0042f);
-  wheelPID[3].configure(0.4543f,0.0603f,0.0035f);
+  // lambda/mu left at 1.0 (classic PID) until AUTOTUNE/MATCH is re-run with
+  // fractional-order search and pastes real per-motor values here.
+  wheelPID[0].configure(0.3420f,0.0084f,0.0030f,1.0f,1.0f);
+  wheelPID[1].configure(0.3000f,0.0034f,0.0030f,1.0f,1.0f);
+  wheelPID[2].configure(0.3000f,0.0034f,0.0030f,1.0f,1.0f);
+  wheelPID[3].configure(0.4543f,0.0243f,0.0035f,1.0f,1.0f);
 
   mpu6050.begin();
   Serial.println(F("INFO,KEEP_ROBOT_STILL_IMU_STARTUP_CALIBRATION"));
