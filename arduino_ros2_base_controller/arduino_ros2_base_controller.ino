@@ -406,19 +406,19 @@ void processCommand(char *line) {
   }
   else if (strcmp(command, "FORWARD") == 0) {
     char *value = strtok_r(NULL, ",", &savePtr);
-    if (!emergencyStopLatched) setVelocityCommand(value ? fabs(atof(value)) : 100.0f, 0.0f);
+    if (!emergencyStopLatched) setVelocityCommand(value ? fabs(atof(value)) : 220.0f, 0.0f);
   }
   else if (strcmp(command, "REVERSE") == 0) {
     char *value = strtok_r(NULL, ",", &savePtr);
-    if (!emergencyStopLatched) setVelocityCommand(-(value ? fabs(atof(value)) : 100.0f), 0.0f);
+    if (!emergencyStopLatched) setVelocityCommand(-(value ? fabs(atof(value)) : 220.0f), 0.0f);
   }
   else if (strcmp(command, "LEFT") == 0) {
     char *value = strtok_r(NULL, ",", &savePtr);
-    if (!emergencyStopLatched) setVelocityCommand(0.0f, value ? fabs(atof(value)) : 45.0f);
+    if (!emergencyStopLatched) setVelocityCommand(0.0f, value ? fabs(atof(value)) : 15.0f);
   }
   else if (strcmp(command, "RIGHT") == 0) {
     char *value = strtok_r(NULL, ",", &savePtr);
-    if (!emergencyStopLatched) setVelocityCommand(0.0f, -(value ? fabs(atof(value)) : 45.0f));
+    if (!emergencyStopLatched) setVelocityCommand(0.0f, -(value ? fabs(atof(value)) : 15.0f));
   }
   else if (strcmp(command, "STOP") == 0) {
     stopCommand(false);
