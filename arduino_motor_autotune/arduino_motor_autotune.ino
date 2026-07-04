@@ -30,9 +30,11 @@
   Commands:
     AUTOTUNE,<motor 1-4>[,<target_mm_s>[,<iterations>]]
       Runs the single-motor autotune search over kp,ki,kd,lambda,mu.
-      Defaults: target_mm_s=220, iterations=8. Prints a TRIAL line per step
-      test and a RESULT line with the final gains when done. Only the
-      chosen motor moves.
+      Defaults: target_mm_s=220, iterations=8. Prints one SAMPLE line per
+      10ms control tick during each step test (raw step response, for
+      offline analysis/plotting), a TRIAL line summarising that step test,
+      and a RESULT line with the final gains when done. Only the chosen
+      motor moves.
     CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>]]
       Open-loop (no PID) PWM sweep from MIN_EFFECTIVE_PWM to MAX_DRIVE_PWM
       on one motor, step size pwm_step, holding each step for hold_ms and
@@ -48,6 +50,20 @@
       Aborts any running autotune/calibration run and releases all motors.
     PING
       Replies PONG.
+
+  Output during each AUTOTUNE step test (one line per control tick):
+    SAMPLE,trial=<n>,motor=<n>,t_ms=...,target_mm_s=...,measured_mm_s=...,
+      error_mm_s=...,ff_pwm=...,correction_pwm=...,pwm=...
+      trial= matches the "trial=" field on the TRIAL/BASELINE summary line
+      printed right after this step test, so a raw response stream can be
+      joined back to the kp/ki/kd/lambda/mu it was recorded under.
+      ff_pwm/correction_pwm are the feed-forward and PID contributions to
+      pwm (their clamped sum), so they show how much each is doing.
+
+  Output after each AUTOTUNE step test:
+    BASELINE,trial=...  or  TRIAL,trial=...
+      Adds trial= (see SAMPLE above) to the existing
+      iter=,param=,kp=,...,steady_err_mm_s= fields.
 
   Output after a completed AUTOTUNE run:
     RESULT,motor=<n>,kp=...,ki=...,kd=...,lambda=...,mu=...,cost=...
@@ -261,6 +277,10 @@ char commandBuffer[96];
 uint8_t commandLength = 0;
 bool abortRequested = false;
 
+// Incremented once per runStepTrial call so each trial's raw SAMPLE stream
+// can be joined back to its summary TRIAL/BASELINE line by "trial=".
+uint16_t trialCounter = 0;
+
 void printReady() {
   Serial.println(F("READY,Motor_autotune_v1"));
 }
@@ -295,7 +315,7 @@ bool pollAbort() {
 // -----------------------------------------------------------------------------
 
 TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
-  TrialResult result = {0.0f, -1.0f, 0.0f, 0.0f, false};
+  TrialResult result = {0.0f, -1.0f, 0.0f, 0.0f, false, ++trialCounter};
 
   wheelPID[motorIndex].reset();
   readEncoderAndResetAtomic(motorIndex);
@@ -335,6 +355,26 @@ TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
       applyMotorOutputForward(motorIndex, out);
 
       const uint32_t elapsedMs = now - start;
+
+      Serial.print(F("SAMPLE,trial="));
+      Serial.print(result.trialId);
+      Serial.print(F(",motor="));
+      Serial.print(motorIndex + 1);
+      Serial.print(F(",t_ms="));
+      Serial.print(elapsedMs);
+      Serial.print(F(",target_mm_s="));
+      Serial.print(targetMMs, 2);
+      Serial.print(F(",measured_mm_s="));
+      Serial.print(filteredSpeed, 2);
+      Serial.print(F(",error_mm_s="));
+      Serial.print(error, 2);
+      Serial.print(F(",ff_pwm="));
+      Serial.print(feedForward, 1);
+      Serial.print(F(",correction_pwm="));
+      Serial.print(correction, 1);
+      Serial.print(F(",pwm="));
+      Serial.println(out, 1);
+
       result.cost += fabs(error) * (elapsedMs * 0.001f) * dt;
 
       if (filteredSpeed > peak) peak = filteredSpeed;
@@ -398,7 +438,8 @@ void printTrial(int iter, int paramIndex, const float params[PARAM_COUNT], const
   else if (paramIndex == 4) name = "mu";
 
   Serial.print(isBaseline ? F("BASELINE,") : F("TRIAL,"));
-  Serial.print(F("iter=")); Serial.print(iter);
+  Serial.print(F("trial=")); Serial.print(r.trialId);
+  Serial.print(F(",iter=")); Serial.print(iter);
   Serial.print(F(",param=")); Serial.print(name);
   Serial.print(F(",kp=")); Serial.print(params[0], 4);
   Serial.print(F(",ki=")); Serial.print(params[1], 4);

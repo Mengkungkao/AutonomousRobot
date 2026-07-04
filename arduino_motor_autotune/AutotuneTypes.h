@@ -92,6 +92,10 @@ struct TrialResult {
   float overshootPct;
   float steadyStateErrorMMs;
   bool aborted;
+  // Matches the "trial=" field on this trial's per-tick SAMPLE lines, so
+  // the raw step-response stream can be joined back to the summary line
+  // (and its kp/ki/kd/lambda/mu) that gets printed right after it.
+  uint16_t trialId;
 };
 
 // Result of one open-loop PWM step in CALIBRATE: steady-state speed measured
