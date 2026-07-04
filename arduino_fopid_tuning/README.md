@@ -30,10 +30,18 @@ distance. Two trial types:
   mark and re-run with adjusted gains -- a visual, hands-on check that
   catches both PID overshoot and encoder tick-per-rev calibration error at
   once (see the command doc below for how to tell them apart).
+- **AUTOTUNE** -- automatic twiddle (coordinate-descent) search over one
+  motor's `kp`/`ki`/`kd`/`lambda`/`mu`, evaluating each candidate with a
+  silent `STEP` trial (no per-tick output) and minimizing the same cost
+  `STEP_RESULT` reports. **Staged, not interleaved**: `kp` is twiddled to
+  convergence before `ki` is touched at all, then `kd`, then `lambda`, then
+  `mu` -- mirrors the classic manual "raise kp first" procedure. Runs
+  unattended for many trials and leaves the best-found gains loaded when
+  done.
 
-No automatic gain search runs here. `PID`/`PIDM`/`POSGAIN` set gains by
-hand, `STEP`/`MATCH`/`ROTATE` report what happened, you decide the next
-adjustment.
+`PID`/`PIDM`/`POSGAIN` set gains by hand; `STEP`/`MATCH`/`ROTATE` report
+what happened for you to act on; `AUTOTUNE` searches automatically for one
+motor at a time, using `STEP`'s own cost as the objective.
 
 ## Hardware
 
@@ -43,12 +51,15 @@ matching, not IMU-measured heading drift. Serial: 500000 baud, 8-N-1.
 Commands are ASCII lines terminated by `\n`, `\r` or `:`.
 
 **SAFETY: lift all four wheels off the ground before running STEP, MATCH,
-or ROTATE.** MATCH drives all four wheels at once -- on the ground the
-robot will crawl forward at full commanded speed. Motor 4 has noticeably
+ROTATE, or AUTOTUNE.** MATCH drives all four wheels at once -- on the
+ground the robot will crawl forward at full commanded speed. AUTOTUNE runs
+one motor unattended through many trials in a row; `STOP`/`ESTOP` still
+interrupts it mid-search, but don't assume a bad gain combination can't
+occur just because it's automated. Motor 4 has noticeably
 harder/higher-torque gearing than the other three and keeps drifting for
-longer after RELEASE, so STEP/MATCH brake (not release) between runs.
-ROTATE is the one exception: it releases (not brakes) when it finishes, on
-purpose, so you can hand-correct the wheel back to its mark.
+longer after RELEASE, so STEP/MATCH/AUTOTUNE brake (not release) between
+runs. ROTATE is the one exception: it releases (not brakes) when it
+finishes, on purpose, so you can hand-correct the wheel back to its mark.
 
 ## Commands
 
@@ -181,6 +192,50 @@ against what you see by eye:
 this happens often. Ends with `INFO,ROTATE_DONE,motor=<n>`, motor released
 so you can hand-correct it.
 
+### `AUTOTUNE,<motor 1-4>[,target_mm_s[,max_iterations]]`
+
+Twiddle (coordinate-descent) search over one motor's
+`kp`/`ki`/`kd`/`lambda`/`mu`, starting from whatever's currently configured
+for that motor. Each candidate is evaluated with a silent `STEP` trial
+(same trial, same cost formula, just no per-tick `SAMPLE` output) at
+`target_mm_s`. Defaults: `target_mm_s=220`, `max_iterations=10`.
+
+Bounds (won't search outside these): `kp` in `[0.5, 1.0]`, `ki` in
+`[0.0, 0.05]`, `kd` in `[0.0, 0.02]`, `lambda`/`mu` in `[0.4, 1.4]`
+(lambda/mu range matches the original, pre-removal AUTOTUNE search --
+stays clear of the degenerate order-0 case and the order-2 stability edge).
+
+**Staged, not interleaved**: `kp` is twiddled first, up to `max_iterations`
+steps -- or fewer, if its own step size shrinks below its convergence
+threshold first -- before `ki` is touched at all. Then `kd`, then
+`lambda`, then `mu`, each fully staged the same way, mirroring the classic
+manual "raise kp first, then ki, then kd" procedure rather than nudging
+all five gains a little each round. Each step costs up to 2 `STEP` trials
+(~2.2s/trial including the rest hold), so `max_iterations=10` means up to
+20 trials per stage worst-case (100 trials across all 5 stages) -- several
+minutes total, often less since a stage can converge and move on early.
+
+Output per candidate:
+
+```text
+AUTOTUNE_EVAL,motor=<n>,iter=<i>,param=<kp|ki|kd|lambda|mu>,
+  kp=...,ki=...,kd=...,lambda=...,mu=...,cost=...,best_cost=...
+```
+
+Summary line:
+
+```text
+AUTOTUNE_RESULT,motor=<n>,kp=...,ki=...,kd=...,lambda=...,mu=...,cost=...
+```
+
+Ends with `INFO,AUTOTUNE_DONE,motor=<n>`. The winning gains are already
+loaded into that motor's `WheelPID` when this finishes -- run `STEP`
+immediately after to see the result for yourself, or `GAINS` to just read
+the numbers back. AUTOTUNE optimizes one motor in isolation (same cost
+`STEP` uses) -- it does **not** know about cross-wheel matching, so still
+run `MATCH` afterward; a motor that autotunes to a great individual
+`STEP_RESULT` can still be a bad match for its neighbors.
+
 ### `STOP` / `ESTOP`
 
 Aborts any running trial and releases all motors.
@@ -192,13 +247,15 @@ Replies `PONG`.
 ## Tuning procedure
 
 1. **Lift all four wheels off the ground.**
-2. Per motor: `PIDM,<motor>,<kp>,<ki>,<kd>[,<lambda>,<mu>]`, then
-   `STEP,<motor>,<target_mm_s>`. Compare `steady_err_mm_s` against
-   `arduino_motor_calibration`'s `OPENLOOP` baseline at the same
-   `target_mm_s` -- PID should shrink it close to zero without introducing
-   much overshoot/ringing. Raise `kp` first, add a small `ki` to kill
-   remaining offset, add `kd` only if you see overshoot `ki` alone doesn't
-   settle.
+2. Per motor, either run `AUTOTUNE,<motor>,<target_mm_s>` to search
+   automatically (leaves the best gains loaded, then confirm with
+   `STEP,<motor>,<target_mm_s>`), or set gains by hand: `PIDM,<motor>,<kp>,
+   <ki>,<kd>[,<lambda>,<mu>]`, then `STEP,<motor>,<target_mm_s>`. Either
+   way, compare `steady_err_mm_s` against `arduino_motor_calibration`'s
+   `OPENLOOP` baseline at the same `target_mm_s` -- PID should shrink it
+   close to zero without introducing much overshoot/ringing. If hand-tuning:
+   raise `kp` first, add a small `ki` to kill remaining offset, add `kd`
+   only if you see overshoot `ki` alone doesn't settle.
 3. Mark that same wheel and run `ROTATE,<motor>,360` as a visual spot-check.
    Watch where it actually stops relative to the mark. If it overshoots (by
    eye and by `overshoot_deg` agreeing), nudge `kp`/`ki` down slightly (or

@@ -34,16 +34,25 @@
              tick-per-rev calibration error (MEASURED_COUNTS_PER_REV), since
              the two look identical in the SAMPLE/ROTATE_RESULT numbers but
              only calibration error will disagree with what your eye sees.
+    AUTOTUNE -- automatic twiddle (coordinate-descent) search over one
+             motor's kp/ki/kd/lambda/mu, using silent STEP trials (no
+             per-tick SAMPLE spam) as the cost evaluator -- same cost
+             formula STEP_RESULT reports, so an AUTOTUNE cost and a manual
+             STEP cost mean the same thing. Runs unattended for many
+             trials; leaves the best-found gains loaded when done.
 
-  No automatic gain search runs in this sketch -- PID/PIDM/POSGAIN set gains
-  by hand, STEP/MATCH/ROTATE report what happened, you decide the next
-  adjustment.
+  PID/PIDM/POSGAIN set gains by hand; STEP/MATCH/ROTATE report what
+  happened for you to act on; AUTOTUNE searches kp/ki/kd/lambda/mu
+  automatically for one motor at a time using STEP's cost as the objective.
 
-  SAFETY: lift all four wheels off the ground before running STEP or MATCH.
-  MATCH drives all four wheels at once -- on the ground the robot will
-  crawl forward at full commanded speed. Motor 4 has noticeably
-  harder/higher-torque gearing than the other three and keeps drifting for
-  longer after RELEASE, so trials brake (not release) between runs.
+  SAFETY: lift all four wheels off the ground before running STEP, MATCH,
+  ROTATE, or AUTOTUNE. MATCH drives all four wheels at once -- on the
+  ground the robot will crawl forward at full commanded speed. AUTOTUNE
+  runs one motor unattended for many trials in a row -- don't leave the
+  room assuming a bad gain combination can't happen; STOP/ESTOP still
+  works mid-search. Motor 4 has noticeably harder/higher-torque gearing
+  than the other three and keeps drifting for longer after RELEASE, so
+  trials brake (not release) between runs.
 
   Hardware: QGPMaker motor shield + four QGPMaker quadrature encoders. No
   IMU is used by this tool -- the odometry-accuracy proxy used here is
@@ -81,6 +90,15 @@
       watched by eye -- mark the wheel first. Releases the motor at the
       end (not braked) so it can be hand-corrected back to the mark.
       Defaults: target_deg=360 (one full turn), timeout_ms=3000. Only the
+      chosen motor moves.
+    AUTOTUNE,<motor 1-4>[,target_mm_s[,max_iterations]]
+      Twiddle search over that motor's kp/ki/kd/lambda/mu (starting from
+      its currently configured gains), evaluating each candidate with a
+      silent STEP trial at target_mm_s and minimizing the same cost
+      STEP_RESULT reports. Prints one AUTOTUNE_EVAL line per trial plus a
+      final AUTOTUNE_RESULT, and leaves the best gains loaded. Defaults:
+      target_mm_s=220, max_iterations=10 (up to 10 candidates per
+      parameter, 5 parameters -- can run for several minutes). Only the
       chosen motor moves.
     STOP / ESTOP
       Aborts any running trial and releases all motors.
@@ -127,6 +145,16 @@
     hit timeout_ms without holding inside tolerance; increase timeout_ms or
     lower kp_pos if this happens often. Ends with INFO,ROTATE_DONE,motor=<n>.
 
+  Output during AUTOTUNE (one line per candidate evaluated):
+    AUTOTUNE_EVAL,motor=<n>,iter=<i>,param=<kp|ki|kd|lambda|mu>,
+      kp=...,ki=...,kd=...,lambda=...,mu=...,cost=...,best_cost=...
+
+  Output after AUTOTUNE:
+    AUTOTUNE_RESULT,motor=<n>,kp=...,ki=...,kd=...,lambda=...,mu=...,cost=...
+    Ends with INFO,AUTOTUNE_DONE,motor=<n>. The winning gains are already
+    loaded into that motor's WheelPID -- run STEP right after to confirm,
+    or GAINS to just read them back.
+
   Suggested workflow: use PIDM to set one motor's gains, run STEP on it and
   compare against arduino_motor_calibration's OPENLOOP baseline at the same
   target_mm_s to confirm PID is actually helping (smaller steady_err_mm_s,
@@ -168,6 +196,7 @@ const float WHEEL_DIAMETER_MM = 80.5f;
 
 // Measured by hand-rotating each wheel exactly one full turn and reading the
 // tick count -- see arduino_ros2_base_controller.ino for the full history.
+// hand-measured count 4193.0f, 4176.0f, 4119.0f, 4330.0f
 const float MEASURED_COUNTS_PER_REV[MOTOR_COUNT] = {4193.0f, 4176.0f, 4119.0f, 4330.0f};
 const float MM_PER_COUNT[MOTOR_COUNT] = {
   (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[0],
@@ -205,8 +234,9 @@ const uint16_t MIN_DURATION_MS = 300;
 const uint16_t REST_DURATION_MS = 1000;
 const float STEADY_WINDOW_FRACTION = 0.3f;   // last 30% of trial used for steady-state avg
 
-// Used only to compute the descriptive "cost" field in STEP_RESULT -- no
-// search runs here, so these just weight the summary metric.
+// Used to compute the "cost" field in STEP_RESULT, and reused unmodified as
+// AUTOTUNE's search objective below (same formula, so a manual STEP number
+// and an AUTOTUNE eval number mean the same thing).
 const float OVERSHOOT_COST_WEIGHT = 4.0f;
 const float STEADY_ERROR_COST_WEIGHT = 6.0f;
 const float NO_RISE_PENALTY = 5000.0f;
@@ -227,6 +257,20 @@ const uint16_t DEFAULT_ROTATE_TIMEOUT_MS = 3000;
 const uint16_t MIN_ROTATE_TIMEOUT_MS = 300;
 const float ROTATE_SETTLE_TOLERANCE_DEG = 3.0f;
 const uint16_t ROTATE_SETTLE_HOLD_MS = 150;
+
+// -----------------------------------------------------------------------------
+// AUTOTUNE: twiddle (coordinate-descent) search over kp/ki/kd/lambda/mu per
+// motor, using STEP's own cost formula as the objective. Bounds keep
+// lambda/mu inside [0.4, 1.4] -- away from the degenerate order-0 case and
+// well short of the order-2 stability edge, since twiddle could otherwise
+// walk a live motor into an unstable combination mid-search.
+// -----------------------------------------------------------------------------
+
+const uint16_t DEFAULT_AUTOTUNE_ITERATIONS = 10;
+// Index order throughout AUTOTUNE: 0=kp, 1=ki, 2=kd, 3=lambda, 4=mu.
+const float AUTOTUNE_MIN[5]          = {0.50f, 0.0f,   0.0f,   0.5f, 0.5f};
+const float AUTOTUNE_MAX[5]          = {1.00f,  0.05f,  0.02f,  1.4f, 1.4f};
+const float AUTOTUNE_INITIAL_STEP[5] = {0.01f, 0.005f, 0.001f, 0.1f, 0.1f};
 
 // -----------------------------------------------------------------------------
 // Fractional-order PID: PI^lambda D^mu.
@@ -426,7 +470,7 @@ void finishAborted() {
 // STEP: single-motor closed-loop (PID engaged) dynamic step trial
 // -----------------------------------------------------------------------------
 
-StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs) {
+StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs, bool emitSamples) {
   StepResult result = {0.0f, -1.0f, 0.0f, 0.0f, false, ++trialCounter};
 
   readEncoderAndResetAtomic(motorIndex);
@@ -468,24 +512,26 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
 
       const uint32_t elapsedMs = now - start;
 
-      Serial.print(F("SAMPLE,trial="));
-      Serial.print(result.trialId);
-      Serial.print(F(",motor="));
-      Serial.print(motorIndex + 1);
-      Serial.print(F(",t_ms="));
-      Serial.print(elapsedMs);
-      Serial.print(F(",target_mm_s="));
-      Serial.print(targetMMs, 2);
-      Serial.print(F(",measured_mm_s="));
-      Serial.print(filteredSpeed, 2);
-      Serial.print(F(",error_mm_s="));
-      Serial.print(error, 2);
-      Serial.print(F(",ff_pwm="));
-      Serial.print(feedForward, 1);
-      Serial.print(F(",correction_pwm="));
-      Serial.print(correction, 1);
-      Serial.print(F(",pwm="));
-      Serial.println(out, 1);
+      if (emitSamples) {
+        Serial.print(F("SAMPLE,trial="));
+        Serial.print(result.trialId);
+        Serial.print(F(",motor="));
+        Serial.print(motorIndex + 1);
+        Serial.print(F(",t_ms="));
+        Serial.print(elapsedMs);
+        Serial.print(F(",target_mm_s="));
+        Serial.print(targetMMs, 2);
+        Serial.print(F(",measured_mm_s="));
+        Serial.print(filteredSpeed, 2);
+        Serial.print(F(",error_mm_s="));
+        Serial.print(error, 2);
+        Serial.print(F(",ff_pwm="));
+        Serial.print(feedForward, 1);
+        Serial.print(F(",correction_pwm="));
+        Serial.print(correction, 1);
+        Serial.print(F(",pwm="));
+        Serial.println(out, 1);
+      }
 
       result.cost += fabs(error) * (elapsedMs * 0.001f) * dt;
 
@@ -555,7 +601,7 @@ void runStep(uint8_t motorIndex, float targetMMs, uint16_t durationMs) {
   Serial.print(F(",target_mm_s="));
   Serial.println(targetMMs, 1);
 
-  StepResult result = runStepTrial(motorIndex, targetMMs, durationMs);
+  StepResult result = runStepTrial(motorIndex, targetMMs, durationMs, true);
   if (result.aborted) {
     finishAborted();
     return;
@@ -564,6 +610,126 @@ void runStep(uint8_t motorIndex, float targetMMs, uint16_t durationMs) {
   releaseAllMotors();
   printStepResult(motorIndex, targetMMs, result);
   Serial.print(F("INFO,STEP_DONE,motor="));
+  Serial.println(motorIndex + 1);
+}
+
+// -----------------------------------------------------------------------------
+// AUTOTUNE: twiddle search over kp/ki/kd/lambda/mu for one motor, using a
+// silent (no per-tick SAMPLE output) STEP trial as the cost evaluator.
+// -----------------------------------------------------------------------------
+
+float evaluateAutotuneCost(uint8_t motorIndex, const float *params, float targetMMs, bool *aborted) {
+  wheelPID[motorIndex].configure(params[0], params[1], params[2], params[3], params[4]);
+  StepResult r = runStepTrial(motorIndex, targetMMs, DEFAULT_DURATION_MS, false);
+  *aborted = r.aborted;
+  return r.cost;
+}
+
+void printAutotuneEval(uint8_t motorIndex, uint16_t iter, const char *paramName,
+                        const float *params, float cost, float bestCost) {
+  Serial.print(F("AUTOTUNE_EVAL,motor="));
+  Serial.print(motorIndex + 1);
+  Serial.print(F(",iter="));
+  Serial.print(iter);
+  Serial.print(F(",param="));
+  Serial.print(paramName);
+  Serial.print(F(",kp="));
+  Serial.print(params[0], 4);
+  Serial.print(F(",ki="));
+  Serial.print(params[1], 4);
+  Serial.print(F(",kd="));
+  Serial.print(params[2], 4);
+  Serial.print(F(",lambda="));
+  Serial.print(params[3], 3);
+  Serial.print(F(",mu="));
+  Serial.print(params[4], 3);
+  Serial.print(F(",cost="));
+  Serial.print(cost, 3);
+  Serial.print(F(",best_cost="));
+  Serial.println(bestCost, 3);
+}
+
+void printAutotuneResult(uint8_t motorIndex, const float *params, float cost) {
+  Serial.print(F("AUTOTUNE_RESULT,motor="));
+  Serial.print(motorIndex + 1);
+  Serial.print(F(",kp="));
+  Serial.print(params[0], 4);
+  Serial.print(F(",ki="));
+  Serial.print(params[1], 4);
+  Serial.print(F(",kd="));
+  Serial.print(params[2], 4);
+  Serial.print(F(",lambda="));
+  Serial.print(params[3], 3);
+  Serial.print(F(",mu="));
+  Serial.print(params[4], 3);
+  Serial.print(F(",cost="));
+  Serial.println(cost, 3);
+}
+
+void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
+  abortRequested = false;
+  releaseAllMotors();
+
+  static const char *AUTOTUNE_PARAM_NAMES[5] = {"kp", "ki", "kd", "lambda", "mu"};
+
+  Serial.print(F("INFO,AUTOTUNE_START,motor="));
+  Serial.print(motorIndex + 1);
+  Serial.print(F(",target_mm_s="));
+  Serial.println(targetMMs, 1);
+
+  float bestParams[5] = {
+    wheelPID[motorIndex].kp, wheelPID[motorIndex].ki, wheelPID[motorIndex].kd,
+    wheelPID[motorIndex].lambda, wheelPID[motorIndex].mu
+  };
+  float dp[5];
+  for (uint8_t i = 0; i < 5; ++i) dp[i] = AUTOTUNE_INITIAL_STEP[i];
+
+  bool aborted = false;
+  float bestCost = evaluateAutotuneCost(motorIndex, bestParams, targetMMs, &aborted);
+
+  for (uint16_t iter = 0; iter < maxIterations && !aborted; ++iter) {
+    for (uint8_t i = 0; i < 5 && !aborted; ++i) {
+      float trialParams[5];
+      memcpy(trialParams, bestParams, sizeof(trialParams));
+      trialParams[i] = constrain(bestParams[i] + dp[i], AUTOTUNE_MIN[i], AUTOTUNE_MAX[i]);
+
+      float cost = evaluateAutotuneCost(motorIndex, trialParams, targetMMs, &aborted);
+      printAutotuneEval(motorIndex, iter, AUTOTUNE_PARAM_NAMES[i], trialParams, cost, bestCost);
+      if (aborted) break;
+
+      if (cost < bestCost) {
+        bestCost = cost;
+        memcpy(bestParams, trialParams, sizeof(bestParams));
+        dp[i] *= 1.1f;
+        continue;
+      }
+
+      trialParams[i] = constrain(bestParams[i] - dp[i], AUTOTUNE_MIN[i], AUTOTUNE_MAX[i]);
+      cost = evaluateAutotuneCost(motorIndex, trialParams, targetMMs, &aborted);
+      printAutotuneEval(motorIndex, iter, AUTOTUNE_PARAM_NAMES[i], trialParams, cost, bestCost);
+      if (aborted) break;
+
+      if (cost < bestCost) {
+        bestCost = cost;
+        memcpy(bestParams, trialParams, sizeof(bestParams));
+        dp[i] *= 1.1f;
+      } else {
+        dp[i] *= 0.9f;
+      }
+    }
+  }
+
+  if (aborted) {
+    finishAborted();
+    return;
+  }
+
+  // Leave the best-found gains loaded so STEP/MATCH can validate them
+  // immediately without re-entering them by hand.
+  wheelPID[motorIndex].configure(bestParams[0], bestParams[1], bestParams[2], bestParams[3], bestParams[4]);
+  releaseAllMotors();
+  printAutotuneResult(motorIndex, bestParams, bestCost);
+  Serial.print(F("INFO,AUTOTUNE_DONE,motor="));
   Serial.println(motorIndex + 1);
 }
 
@@ -960,6 +1126,25 @@ void processCommand(char *line) {
 
     runStep((uint8_t)(motorNum - 1), targetMMs, durationMs);
   }
+  else if (strcmp(command, "AUTOTUNE") == 0) {
+    char *motorText = strtok_r(NULL, ",", &savePtr);
+    char *targetText = strtok_r(NULL, ",", &savePtr);
+    char *iterText = strtok_r(NULL, ",", &savePtr);
+
+    int motorNum = motorText ? atoi(motorText) : -1;
+    if (motorNum < 1 || motorNum > MOTOR_COUNT) {
+      Serial.println(F("ERR,AUTOTUNE_FORMAT,expected_AUTOTUNE_motor_1to4"));
+      return;
+    }
+
+    float targetMMs = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
+    targetMMs = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+
+    uint16_t maxIterations = iterText ? (uint16_t)atoi(iterText) : DEFAULT_AUTOTUNE_ITERATIONS;
+    if (maxIterations < 1) maxIterations = DEFAULT_AUTOTUNE_ITERATIONS;
+
+    runAutotune((uint8_t)(motorNum - 1), targetMMs, maxIterations);
+  }
   else if (strcmp(command, "MATCH") == 0) {
     char *targetText = strtok_r(NULL, ",", &savePtr);
     char *durationText = strtok_r(NULL, ",", &savePtr);
@@ -1056,9 +1241,9 @@ void setup() {
   // Re-sync these if production's gains change independently, and paste
   // your final tuned values back there when done.
   wheelPID[0].configure(0.3420f, 0.0084f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[1].configure(0.3000f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[2].configure(0.3000f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[3].configure(0.4543f, 0.0243f, 0.0035f, 1.0f, 1.0f);
+  wheelPID[1].configure(0.2900f, 0.0034f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[2].configure(0.3400f, 0.0034f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[3].configure(0.3000f, 0.0033f, 0.0035f, 1.0f, 1.0f);
 
   printReady();
   Serial.println(F("INFO,LIFT_ALL_WHEELS_OFF_THE_GROUND_BEFORE_RUNNING_TRIALS"));

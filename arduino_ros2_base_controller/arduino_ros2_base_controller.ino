@@ -81,6 +81,7 @@ const float WHEEL_RADIUS_MM = WHEEL_DIAMETER_MM * 0.5f;
 // instead of a single shared constant fix that at the source.
 //by hand 1st time :4326.0f, 4226.0f, 4138.0f, 4334.0f
 //by hand 2nd time : 4193.0f, 4176.0f, 4119.0f, 4330.0f
+//by hand 3rd time:  4201.0f, 4154.0f, 4128.0f, 4235.0f
 const float MEASURED_COUNTS_PER_REV[MOTOR_COUNT] = {4193.0f, 4176.0f, 4119.0f, 4330.0f};
 const float MM_PER_COUNT[MOTOR_COUNT] = {
   (PI * WHEEL_DIAMETER_MM) / MEASURED_COUNTS_PER_REV[0],
@@ -643,10 +644,10 @@ void setup() {
   // }
   // lambda/mu left at 1.0 (classic PID) until AUTOTUNE/MATCH is re-run with
   // fractional-order search and pastes real per-motor values here.
-  wheelPID[0].configure(0.3420f,0.0084f,0.0030f,1.0f,1.0f);
-  wheelPID[1].configure(0.3000f,0.0034f,0.0030f,1.0f,1.0f);
-  wheelPID[2].configure(0.3000f,0.0034f,0.0030f,1.0f,1.0f);
-  wheelPID[3].configure(0.4543f,0.0243f,0.0035f,1.0f,1.0f);
+  wheelPID[0].configure(0.3420f, 0.0084f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[1].configure(0.2900f, 0.0034f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[2].configure(0.3400f, 0.0034f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[3].configure(0.3000f, 0.0033f, 0.0035f, 1.0f, 1.0f);
 
   mpu6050.begin();
   Serial.println(F("INFO,KEEP_ROBOT_STILL_IMU_STARTUP_CALIBRATION"));
