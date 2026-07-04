@@ -1,5 +1,5 @@
 /*
-  mDetect standalone per-wheel PID autotune tool
+  mDetect standalone per-wheel Calibration and PID tuning tool
 
   This is a SEPARATE sketch from arduino_ros2_base_controller.ino. It does
   not include, import, or modify that sketch or any of its files -- all
@@ -119,7 +119,7 @@ const float MM_PER_COUNT[MOTOR_COUNT] = {
 };
 
 const float MAX_WHEEL_MM_S = 300.0f;
-const uint8_t MIN_EFFECTIVE_PWM = 48;
+const uint8_t MIN_EFFECTIVE_PWM = 50;
 const uint8_t MAX_DRIVE_PWM = 210;
 
 // Motor order: 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.

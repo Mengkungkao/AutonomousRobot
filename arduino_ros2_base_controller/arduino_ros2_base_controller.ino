@@ -97,7 +97,7 @@ const float MAX_WHEEL_MM_S = 250.0f;
 const float LINEAR_ACCEL_MM_S2 = 150.0f;
 const float ANGULAR_ACCEL_DEG_S2 = 120.0f;
 
-const uint8_t MIN_EFFECTIVE_PWM = 48;
+const uint8_t MIN_EFFECTIVE_PWM = 50;
 const uint8_t MAX_DRIVE_PWM = 210;
 
 // Existing encoder installation signs. Forward motion must produce positive
