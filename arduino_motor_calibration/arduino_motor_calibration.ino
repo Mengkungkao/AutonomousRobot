@@ -37,7 +37,7 @@
       -- e.g. from the real response saturating at high PWM, which a
       straight-line fit doesn't capture -- is visible directly. Re-run
       after updating those constants to check the new fit. Defaults:
-      pwm_step=20, hold_ms=1000. Only the chosen motor moves.
+      pwm_step=10, hold_ms=1000. Only the chosen motor moves.
     OPENLOOP,<motor 1-4>[,<target_mm_s>]
       Runs one dynamic step test at target_mm_s, feed-forward PWM only
       (correction forced to 0 -- no PID involved at all), printing one
@@ -78,7 +78,7 @@
 
 #include "QGPMaker_MotorShield.h"
 #include "QGPMaker_Encoder.h"
-#include "AutotuneTypes.h"
+#include "CalibrationTypes.h"
 
 // -----------------------------------------------------------------------------
 // Constants copied from arduino_ros2_base_controller.ino so results transfer
@@ -150,7 +150,7 @@ const float NO_RISE_PENALTY = 5000.0f;
 // CALIBRATE tuning knobs
 // -----------------------------------------------------------------------------
 
-const uint8_t DEFAULT_CAL_PWM_STEP = 20;
+const uint8_t DEFAULT_CAL_PWM_STEP = 10;
 const uint16_t DEFAULT_CAL_HOLD_MS = 1000;
 // Last fraction of each step's hold used for the steady-state speed average,
 // same idea as STEADY_WINDOW_FRACTION above.
