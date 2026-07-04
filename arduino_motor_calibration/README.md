@@ -29,23 +29,28 @@ will crawl into whatever is in front of it.
 
 ## Commands
 
-### `CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>]]`
+### `CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>[,<F|R>]]]`
 
 Open-loop (no PID) PWM sweep from `MIN_EFFECTIVE_PWM` to `MAX_DRIVE_PWM` on
 one motor, step size `pwm_step`, holding each step for `hold_ms` and
-measuring steady-state speed from the encoder. Reports each step's speed
-against what that motor's own calibrated feed-forward curve
-(`FF_SLOPE_MM_S_PER_PWM`/`FF_INTERCEPT_MM_S`, used by `speedFeedForwardPWM`)
+measuring steady-state speed from the encoder. The optional 4th argument
+picks the drive direction: `F` (default) forward, `R` reverse. **Motors are
+not direction-symmetric** -- the reverse sweep must be run separately to fit
+`FF_SLOPE_MM_S_PER_PWM_REV`/`FF_INTERCEPT_MM_S_REV`; reusing the
+forward-only fit for reverse is what made the production controller's
+reverse driving veer off a straight line. Reports each step's speed against
+what that motor's calibrated feed-forward curve **for that direction**
 predicts for that PWM, so any remaining gap -- e.g. from the real response
 saturating at high PWM, which a straight-line fit doesn't capture -- is
 visible directly.
 
-Defaults: `pwm_step=10`, `hold_ms=1000`. Only the chosen motor moves.
+Defaults: `pwm_step=10`, `hold_ms=1000`, direction=`F`. Only the chosen
+motor moves.
 
-Output per step:
+Output per step (speeds are positive magnitudes in both directions):
 
 ```text
-CAL,motor=<n>,pwm=...,measured_mm_s=...,expected_mm_s=...,error_mm_s=...,error_pct=...
+CAL,motor=<n>,dir=<F|R>,pwm=...,measured_mm_s=...,expected_mm_s=...,error_mm_s=...,error_pct=...
 ```
 
 Ends with `INFO,CALIBRATE_DONE,motor=<n>`.
@@ -53,14 +58,16 @@ Ends with `INFO,CALIBRATE_DONE,motor=<n>`.
 ### `OPENLOOP,<motor 1-4>[,<target_mm_s>]`
 
 Runs one dynamic step test at `target_mm_s`, feed-forward PWM only
-(correction forced to 0 -- no PID involved at all). Defaults:
-`target_mm_s=220`. Only the chosen motor moves.
+(correction forced to 0 -- no PID involved at all). A **negative**
+`target_mm_s` (e.g. `OPENLOOP,2,-220`) drives the wheel in reverse; output
+speeds stay positive magnitudes with `dir=R` marking the direction.
+Defaults: `target_mm_s=220`. Only the chosen motor moves.
 
 Output, one line per 10ms control tick (raw step response, for offline
 analysis/plotting):
 
 ```text
-SAMPLE,trial=<n>,motor=<n>,t_ms=...,target_mm_s=...,measured_mm_s=...,
+SAMPLE,trial=<n>,motor=<n>,dir=<F|R>,t_ms=...,target_mm_s=...,measured_mm_s=...,
   error_mm_s=...,ff_pwm=...,correction_pwm=0.0,pwm=...
 ```
 
@@ -72,7 +79,7 @@ a PID-driven trial); `pwm` is just the clamped `ff_pwm`.
 Summary line:
 
 ```text
-OPENLOOP_RESULT,trial=<n>,motor=<n>,target_mm_s=...,rise_s=...,
+OPENLOOP_RESULT,trial=<n>,motor=<n>,dir=<F|R>,target_mm_s=...,rise_s=...,
   overshoot_pct=...,steady_err_mm_s=...,cost=...
 ```
 
@@ -108,6 +115,31 @@ Replies `PONG`.
 6. Move to `arduino_ros2_base_controller.ino` and hand-tune PID per motor
    (see below), using step 5's numbers as the "before PID" reference to
    compare closed-loop behaviour against.
+
+## Reverse calibration procedure
+
+The forward sweep above says nothing about reverse: these gearmotors'
+PWM-to-speed response differs by direction (brush geometry, gearbox
+friction, H-bridge drop), and reusing the forward fit for reverse left each
+wheel with a different large feed-forward error -- which is exactly why
+reverse driving veered off a straight line while forward drove acceptably.
+Repeat the same steps in reverse:
+
+1. **Lift all four wheels off the ground.**
+2. Run `CALIBRATE,<motor>,10,1000,R` for each of the 4 motors.
+3. Fit each motor's reverse linear model the same way and update
+   `FF_SLOPE_MM_S_PER_PWM_REV`/`FF_INTERCEPT_MM_S_REV` in **both**
+   `arduino_motor_calibration.ino` and `arduino_ros2_base_controller.ino`
+   (and `arduino_fopid_tuning.ino` if you tune with it). Until this is done
+   those `_REV` arrays are just seeded with the forward fit.
+4. Re-run `CALIBRATE,<motor>,10,1000,R` to confirm the residual against the
+   new reverse fit is small and stable.
+5. Run `OPENLOOP,<motor>,-220` per motor for the reverse open-loop dynamic
+   baseline.
+6. Verify on the ground with `REVERSE,220` on the production controller --
+   and with `arduino_fopid_tuning`'s `MATCH,-220`, whose
+   `left_right_diff_mm_s`/`spread_mm_s` are the numbers that predict
+   reverse straight-line drift.
 
 ## Worked example (2026-07-04)
 

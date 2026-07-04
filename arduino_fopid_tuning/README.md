@@ -82,20 +82,24 @@ GAINS,motor=<n>,kp=...,ki=...,kd=...,lambda=...,mu=...
 
 ### `STEP,<motor 1-4>[,target_mm_s[,duration_ms]]`
 
-Single-wheel closed-loop dynamic step trial at `target_mm_s`. Defaults:
-`target_mm_s=220`, `duration_ms=1200`. Only the chosen motor moves.
+Single-wheel closed-loop dynamic step trial at `target_mm_s`. A **negative**
+`target_mm_s` (e.g. `STEP,2,-220`) runs the trial in reverse -- motors are
+not direction-symmetric, so reverse behaviour has to be checked with
+reverse trials. Output speeds stay positive magnitudes with `dir=R` marking
+the direction. Defaults: `target_mm_s=220`, `duration_ms=1200`. Only the
+chosen motor moves.
 
 Output per control tick:
 
 ```text
-SAMPLE,trial=<n>,motor=<n>,t_ms=...,target_mm_s=...,measured_mm_s=...,
+SAMPLE,trial=<n>,motor=<n>,dir=<F|R>,t_ms=...,target_mm_s=...,measured_mm_s=...,
   error_mm_s=...,ff_pwm=...,correction_pwm=...,pwm=...
 ```
 
 Summary line:
 
 ```text
-STEP_RESULT,trial=<n>,motor=<n>,target_mm_s=...,rise_s=...,
+STEP_RESULT,trial=<n>,motor=<n>,dir=<F|R>,target_mm_s=...,rise_s=...,
   overshoot_pct=...,steady_err_mm_s=...,cost=...
 ```
 
@@ -104,13 +108,17 @@ Ends with `INFO,STEP_DONE,motor=<n>`.
 ### `MATCH[,target_mm_s[,duration_ms]]`
 
 Runs all four motors closed-loop at the same `target_mm_s` simultaneously.
-Defaults: `target_mm_s=220`, `duration_ms=1200`. **All four motors move --
-wheels must be off the ground.**
+A **negative** `target_mm_s` (`MATCH,-220`) runs all four wheels in reverse
+-- this is the trial that predicts reverse straight-line drift; run it
+after fitting the reverse feed-forward curves
+(`arduino_motor_calibration`'s `CALIBRATE,<motor>,10,1000,R`) to verify
+reverse driving. Defaults: `target_mm_s=220`, `duration_ms=1200`. **All
+four motors move -- wheels must be off the ground.**
 
 Output per control tick:
 
 ```text
-SAMPLE,trial=<n>,t_ms=...,target_mm_s=...,
+SAMPLE,trial=<n>,dir=<F|R>,t_ms=...,target_mm_s=...,
   m1_mm_s=...,m2_mm_s=...,m3_mm_s=...,m4_mm_s=...,
   m1_pwm=...,m2_pwm=...,m3_pwm=...,m4_pwm=...
 ```
@@ -118,7 +126,7 @@ SAMPLE,trial=<n>,t_ms=...,target_mm_s=...,
 Summary line:
 
 ```text
-MATCH_RESULT,trial=<n>,target_mm_s=...,
+MATCH_RESULT,trial=<n>,dir=<F|R>,target_mm_s=...,
   m1_ss_mm_s=...,m2_ss_mm_s=...,m3_ss_mm_s=...,m4_ss_mm_s=...,
   m1_err_mm_s=...,m2_err_mm_s=...,m3_err_mm_s=...,m4_err_mm_s=...,
   left_avg_mm_s=...,right_avg_mm_s=...,left_right_diff_mm_s=...,
@@ -198,7 +206,8 @@ Twiddle (coordinate-descent) search over one motor's
 `kp`/`ki`/`kd`/`lambda`/`mu`, starting from whatever's currently configured
 for that motor. Each candidate is evaluated with a silent `STEP` trial
 (same trial, same cost formula, just no per-tick `SAMPLE` output) at
-`target_mm_s`. Defaults: `target_mm_s=220`, `max_iterations=10`.
+`target_mm_s`. A **negative** `target_mm_s` evaluates candidates against
+reverse trials instead. Defaults: `target_mm_s=220`, `max_iterations=10`.
 
 Bounds (won't search outside these): `kp` in `[0.5, 1.0]`, `ki` in
 `[0.0, 0.05]`, `kd` in `[0.0, 0.02]`, `lambda`/`mu` in `[0.4, 1.4]`

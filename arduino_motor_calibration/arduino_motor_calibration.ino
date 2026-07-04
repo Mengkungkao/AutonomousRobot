@@ -27,48 +27,56 @@
   \n, \r or ':'.
 
   Commands:
-    CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>]]
+    CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>[,<F|R>]]]
       Open-loop (no PID) PWM sweep from MIN_EFFECTIVE_PWM to MAX_DRIVE_PWM
       on one motor, step size pwm_step, holding each step for hold_ms and
-      measuring steady-state speed from the encoder. Reports each step's
-      speed against what that motor's own calibrated feed-forward curve
-      (FF_SLOPE_MM_S_PER_PWM/FF_INTERCEPT_MM_S, used by
-      speedFeedForwardPWM) predicts for that PWM, so any remaining gap
+      measuring steady-state speed from the encoder. The optional 4th
+      argument picks the drive direction: F (default) forward, R reverse.
+      Motors are NOT direction-symmetric, so the reverse sweep must be run
+      separately to fit FF_SLOPE_MM_S_PER_PWM_REV/FF_INTERCEPT_MM_S_REV --
+      a forward-only fit reused for reverse is what made the production
+      controller's reverse driving veer off a straight line. Reports each
+      step's speed against what that motor's calibrated feed-forward curve
+      for THAT direction predicts for that PWM, so any remaining gap
       -- e.g. from the real response saturating at high PWM, which a
       straight-line fit doesn't capture -- is visible directly. Re-run
       after updating those constants to check the new fit. Defaults:
-      pwm_step=10, hold_ms=1000. Only the chosen motor moves.
+      pwm_step=10, hold_ms=1000, direction=F. Only the chosen motor moves.
     OPENLOOP,<motor 1-4>[,<target_mm_s>]
       Runs one dynamic step test at target_mm_s, feed-forward PWM only
       (correction forced to 0 -- no PID involved at all), printing one
       SAMPLE line per 10ms control tick (raw step response, for offline
-      analysis/plotting) plus a summary OPENLOOP_RESULT line. Defaults:
-      target_mm_s=220. Only the chosen motor moves.
+      analysis/plotting) plus a summary OPENLOOP_RESULT line. A negative
+      target_mm_s (e.g. OPENLOOP,2,-220) drives the wheel in reverse;
+      speeds in the output stay positive magnitudes with dir=R marking
+      the direction. Defaults: target_mm_s=220. Only the chosen motor
+      moves.
     STOP / ESTOP
       Aborts any running trial and releases all motors.
     PING
       Replies PONG.
 
   Output during each OPENLOOP step test (one line per control tick):
-    SAMPLE,trial=<n>,motor=<n>,t_ms=...,target_mm_s=...,measured_mm_s=...,
-      error_mm_s=...,ff_pwm=...,correction_pwm=0.0,pwm=...
+    SAMPLE,trial=<n>,motor=<n>,dir=<F|R>,t_ms=...,target_mm_s=...,
+      measured_mm_s=...,error_mm_s=...,ff_pwm=...,correction_pwm=0.0,pwm=...
       trial= matches the "trial=" field on the OPENLOOP_RESULT summary
       line printed right after this step test. correction_pwm is always 0
       here (kept in the output for format parity with a PID-driven trial);
       pwm is just the clamped ff_pwm.
 
   Output after each OPENLOOP step test:
-    OPENLOOP_RESULT,trial=<n>,motor=<n>,target_mm_s=...,rise_s=...,
+    OPENLOOP_RESULT,trial=<n>,motor=<n>,dir=<F|R>,target_mm_s=...,rise_s=...,
       overshoot_pct=...,steady_err_mm_s=...,cost=...
       Same shape as AUTOTUNE's old per-trial summary, minus the gains --
       there's nothing being searched, this is purely descriptive.
 
   Output after each CALIBRATE step:
-    CAL,motor=<n>,pwm=...,measured_mm_s=...,expected_mm_s=...,
+    CAL,motor=<n>,dir=<F|R>,pwm=...,measured_mm_s=...,expected_mm_s=...,
       error_mm_s=...,error_pct=...
       expected_mm_s is what speedFeedForwardPWM's linear PWM-to-speed
-      assumption predicts for that PWM; error_mm_s/error_pct is
-      measured_mm_s's deviation from it. Ends with INFO,CALIBRATE_DONE.
+      assumption for the driven direction predicts for that PWM;
+      error_mm_s/error_pct is measured_mm_s's deviation from it. Speeds are
+      positive magnitudes in both directions. Ends with INFO,CALIBRATE_DONE.
 */
 
 #include <Wire.h>
@@ -125,6 +133,16 @@ const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 // a bit at high PWM); PID still corrects the remainder.
 const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
 const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+
+// Reverse-direction fit. DC gearmotors are NOT direction-symmetric, and the
+// fit above only ever drove the wheels FORWARD -- run the reverse sweep
+// (CALIBRATE,<motor>,10,1000,R), fit these the same way, and keep them in
+// sync with arduino_ros2_base_controller.ino's copy. Seeded with the
+// forward fit until that sweep has been run, so a reverse CAL line's
+// expected_mm_s/error columns show exactly how wrong the forward fit is in
+// reverse.
+const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
 
 // -----------------------------------------------------------------------------
 // OPENLOOP step-trial knobs
@@ -201,9 +219,12 @@ void brakeMotor(uint8_t index) {
   m->run(BRAKE);
 }
 
-// Trials only ever drive a wheel forward -- direction sign isn't part of
-// what's being measured here.
-void applyMotorOutputForward(uint8_t index, float magnitudePWM) {
+// Trials drive one wheel in a single direction; magnitudePWM is always the
+// unsigned drive strength and `reverse` picks FORWARD vs BACKWARD. Reverse
+// trials exist because the motors' PWM-to-speed response differs by
+// direction, and a forward-only fit is what made the production
+// controller's reverse driving veer off a straight line.
+void applyMotorOutputDir(uint8_t index, float magnitudePWM, bool reverse) {
   uint8_t pwm = (uint8_t)constrain((int)(magnitudePWM + 0.5f), 0, 255);
   QGPMaker_DCMotor *m = getMotor(index);
   if (pwm < 1) {
@@ -211,12 +232,18 @@ void applyMotorOutputForward(uint8_t index, float magnitudePWM) {
     m->run(RELEASE);
     return;
   }
-  m->run(FORWARD);
+  m->run(reverse ? BACKWARD : FORWARD);
   m->setSpeed(pwm);
 }
 
-float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
-  const float pwm = (targetMMs - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+// targetMMs is an unsigned magnitude here; `reverse` selects which
+// direction's fit to invert.
+float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex, bool reverse) {
+  const float slope = reverse ? FF_SLOPE_MM_S_PER_PWM_REV[motorIndex]
+                              : FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
+                                  : FF_INTERCEPT_MM_S[motorIndex];
+  const float pwm = (targetMMs - intercept) / slope;
   return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
@@ -271,8 +298,12 @@ void finishAborted() {
 // OPENLOOP: dynamic step-response trial, feed-forward only (no PID at all)
 // -----------------------------------------------------------------------------
 
-TrialResult runOpenLoopTrial(uint8_t motorIndex, float targetMMs) {
+TrialResult runOpenLoopTrial(uint8_t motorIndex, float targetMMs, bool reverse) {
   TrialResult result = {0.0f, -1.0f, 0.0f, 0.0f, false, ++trialCounter};
+
+  // All math below runs in the trial's own direction: measured speed is
+  // sign-flipped for reverse so target/measured/error stay positive.
+  const float dirSign = reverse ? -1.0f : 1.0f;
 
   readEncoderAndResetAtomic(motorIndex);
   float filteredSpeed = 0.0f;
@@ -300,14 +331,14 @@ TrialResult runOpenLoopTrial(uint8_t motorIndex, float targetMMs) {
       dt = constrain(dt, 0.005f, 0.050f);
 
       const int32_t rawTicks = readEncoderAndResetAtomic(motorIndex);
-      const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex];
+      const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex] * dirSign;
       const float rawSpeed = (signedTicks * MM_PER_COUNT[motorIndex]) / dt;
       filteredSpeed += 0.35f * (rawSpeed - filteredSpeed);
 
       const float error = targetMMs - filteredSpeed;
-      const float feedForward = speedFeedForwardPWM(targetMMs, motorIndex);
+      const float feedForward = speedFeedForwardPWM(targetMMs, motorIndex, reverse);
       const float out = constrain(feedForward, 0.0f, 255.0f);
-      applyMotorOutputForward(motorIndex, out);
+      applyMotorOutputDir(motorIndex, out, reverse);
 
       const uint32_t elapsedMs = now - start;
 
@@ -315,6 +346,8 @@ TrialResult runOpenLoopTrial(uint8_t motorIndex, float targetMMs) {
       Serial.print(result.trialId);
       Serial.print(F(",motor="));
       Serial.print(motorIndex + 1);
+      Serial.print(F(",dir="));
+      Serial.print(reverse ? 'R' : 'F');
       Serial.print(F(",t_ms="));
       Serial.print(elapsedMs);
       Serial.print(F(",target_mm_s="));
@@ -372,11 +405,13 @@ TrialResult runOpenLoopTrial(uint8_t motorIndex, float targetMMs) {
   return result;
 }
 
-void printOpenLoopResult(uint8_t motorIndex, float targetMMs, const TrialResult &r) {
+void printOpenLoopResult(uint8_t motorIndex, float targetMMs, bool reverse, const TrialResult &r) {
   Serial.print(F("OPENLOOP_RESULT,trial="));
   Serial.print(r.trialId);
   Serial.print(F(",motor="));
   Serial.print(motorIndex + 1);
+  Serial.print(F(",dir="));
+  Serial.print(reverse ? 'R' : 'F');
   Serial.print(F(",target_mm_s="));
   Serial.print(targetMMs, 1);
   Serial.print(F(",rise_s="));
@@ -389,23 +424,25 @@ void printOpenLoopResult(uint8_t motorIndex, float targetMMs, const TrialResult 
   Serial.println(r.cost, 3);
 }
 
-void runOpenLoop(uint8_t motorIndex, float targetMMs) {
+void runOpenLoop(uint8_t motorIndex, float targetMMs, bool reverse) {
   abortRequested = false;
   releaseAllMotors();
 
   Serial.print(F("INFO,OPENLOOP_START,motor="));
   Serial.print(motorIndex + 1);
+  Serial.print(F(",dir="));
+  Serial.print(reverse ? 'R' : 'F');
   Serial.print(F(",target_mm_s="));
   Serial.println(targetMMs, 1);
 
-  TrialResult result = runOpenLoopTrial(motorIndex, targetMMs);
+  TrialResult result = runOpenLoopTrial(motorIndex, targetMMs, reverse);
   if (result.aborted) {
     finishAborted();
     return;
   }
 
   releaseAllMotors();
-  printOpenLoopResult(motorIndex, targetMMs, result);
+  printOpenLoopResult(motorIndex, targetMMs, reverse, result);
   Serial.print(F("INFO,OPENLOOP_DONE,motor="));
   Serial.println(motorIndex + 1);
 }
@@ -421,12 +458,16 @@ void runOpenLoop(uint8_t motorIndex, float targetMMs) {
 // correction ever engages.
 // -----------------------------------------------------------------------------
 
-CalStepResult runCalibrationStep(uint8_t motorIndex, uint8_t pwm, uint16_t holdMs) {
+CalStepResult runCalibrationStep(uint8_t motorIndex, uint8_t pwm, uint16_t holdMs, bool reverse) {
   CalStepResult result = {0.0f, false};
+
+  // Reverse steps report speed as a positive magnitude in the driven
+  // direction, so forward and reverse sweeps fit the same way.
+  const float dirSign = reverse ? -1.0f : 1.0f;
 
   readEncoderAndResetAtomic(motorIndex);
   float filteredSpeed = 0.0f;
-  applyMotorOutputForward(motorIndex, pwm);
+  applyMotorOutputDir(motorIndex, pwm, reverse);
 
   const uint32_t start = millis();
   uint32_t last = start;
@@ -448,7 +489,7 @@ CalStepResult runCalibrationStep(uint8_t motorIndex, uint8_t pwm, uint16_t holdM
       dt = constrain(dt, 0.005f, 0.050f);
 
       const int32_t rawTicks = readEncoderAndResetAtomic(motorIndex);
-      const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex];
+      const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex] * dirSign;
       const float rawSpeed = (signedTicks * MM_PER_COUNT[motorIndex]) / dt;
       filteredSpeed += 0.35f * (rawSpeed - filteredSpeed);
 
@@ -476,31 +517,38 @@ CalStepResult runCalibrationStep(uint8_t motorIndex, uint8_t pwm, uint16_t holdM
   return result;
 }
 
-void runCalibration(uint8_t motorIndex, uint8_t pwmStep, uint16_t holdMs) {
+void runCalibration(uint8_t motorIndex, uint8_t pwmStep, uint16_t holdMs, bool reverse) {
   abortRequested = false;
   releaseAllMotors();
 
   Serial.print(F("INFO,CALIBRATE_START,motor="));
   Serial.print(motorIndex + 1);
+  Serial.print(F(",dir="));
+  Serial.print(reverse ? 'R' : 'F');
   Serial.print(F(",pwm_step="));
   Serial.print(pwmStep);
   Serial.print(F(",hold_ms="));
   Serial.println(holdMs);
 
   for (uint16_t pwm = MIN_EFFECTIVE_PWM; pwm <= MAX_DRIVE_PWM; pwm += pwmStep) {
-    CalStepResult step = runCalibrationStep(motorIndex, (uint8_t)pwm, holdMs);
+    CalStepResult step = runCalibrationStep(motorIndex, (uint8_t)pwm, holdMs, reverse);
     if (step.aborted) {
       finishAborted();
       return;
     }
 
-    const float expectedMMs =
-      FF_SLOPE_MM_S_PER_PWM[motorIndex] * (float)pwm + FF_INTERCEPT_MM_S[motorIndex];
+    const float slope = reverse ? FF_SLOPE_MM_S_PER_PWM_REV[motorIndex]
+                                : FF_SLOPE_MM_S_PER_PWM[motorIndex];
+    const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
+                                    : FF_INTERCEPT_MM_S[motorIndex];
+    const float expectedMMs = slope * (float)pwm + intercept;
     const float errorMMs = step.measuredMMs - expectedMMs;
     const float errorPct = (expectedMMs > 1.0f) ? (errorMMs / expectedMMs * 100.0f) : 0.0f;
 
     Serial.print(F("CAL,motor="));
     Serial.print(motorIndex + 1);
+    Serial.print(F(",dir="));
+    Serial.print(reverse ? 'R' : 'F');
     Serial.print(F(",pwm="));
     Serial.print(pwm);
     Serial.print(F(",measured_mm_s="));
@@ -535,6 +583,7 @@ void processCommand(char *line) {
     char *motorText = strtok_r(NULL, ",", &savePtr);
     char *stepText = strtok_r(NULL, ",", &savePtr);
     char *holdText = strtok_r(NULL, ",", &savePtr);
+    char *dirText = strtok_r(NULL, ",", &savePtr);
 
     int motorNum = motorText ? atoi(motorText) : -1;
     if (motorNum < 1 || motorNum > MOTOR_COUNT) {
@@ -548,7 +597,9 @@ void processCommand(char *line) {
     uint16_t holdMs = holdText ? (uint16_t)atoi(holdText) : DEFAULT_CAL_HOLD_MS;
     if (holdMs < 100) holdMs = DEFAULT_CAL_HOLD_MS;
 
-    runCalibration((uint8_t)(motorNum - 1), (uint8_t)pwmStep, holdMs);
+    const bool reverse = dirText && (dirText[0] == 'R' || dirText[0] == 'r');
+
+    runCalibration((uint8_t)(motorNum - 1), (uint8_t)pwmStep, holdMs, reverse);
   }
   else if (strcmp(command, "OPENLOOP") == 0) {
     char *motorText = strtok_r(NULL, ",", &savePtr);
@@ -560,10 +611,13 @@ void processCommand(char *line) {
       return;
     }
 
-    float targetMMs = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
-    targetMMs = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    // A negative target runs the trial in reverse (e.g. OPENLOOP,2,-220);
+    // trial math and output stay in positive magnitudes either way.
+    float targetSigned = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
+    const bool reverse = targetSigned < 0.0f;
+    float targetMMs = constrain(fabs(targetSigned), 30.0f, MAX_WHEEL_MM_S);
 
-    runOpenLoop((uint8_t)(motorNum - 1), targetMMs);
+    runOpenLoop((uint8_t)(motorNum - 1), targetMMs, reverse);
   }
   else if (strcmp(command, "STOP") == 0 || strcmp(command, "ESTOP") == 0) {
     releaseAllMotors();

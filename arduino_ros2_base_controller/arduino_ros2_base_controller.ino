@@ -120,6 +120,19 @@ const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
 const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
 const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
 
+// Reverse-direction fit. DC gearmotors are NOT direction-symmetric (brush
+// geometry, gearbox friction, H-bridge drop all differ by direction), and
+// the sweep above only ever drove the wheels FORWARD -- reusing it for
+// reverse gave each wheel a different large feed-forward error, which is
+// what made reverse driving veer off a straight line. Measure these with
+// arduino_motor_calibration's CALIBRATE,<motor>,10,1000,R reverse sweep and
+// paste the per-motor fits here. Until then they are seeded with the
+// forward fit as a best available guess; the PID integral (see
+// INTEGRAL_PWM_LIMIT) now has enough authority to hold the remaining error
+// down in the meantime.
+const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+
 // MPU sign: a physical left turn must make ROS yaw increase. Set to -1.0 if the
 // yaw decreases during a left-turn test.
 const float IMU_YAW_SIGN = 1.0f;
@@ -154,6 +167,17 @@ MPU6050 mpu6050(Wire);
 // reduces byte-for-byte to the original classic PID. Identical shape to
 // arduino_motor_autotune's WheelPID (in AutotuneTypes.h) so autotune
 // results transfer directly.
+
+// Anti-windup bound expressed as the integral term's maximum OUTPUT
+// contribution (ki * integral, in PWM counts), not as a raw error-sum.
+// The old fixed +/-500 error-sum clamp let ki=0.0034 contribute at most
+// ~1.7 PWM -- nowhere near enough to absorb real feed-forward error
+// (reverse drive's per-wheel FF mismatch is tens of PWM), so each wheel
+// held a different permanent speed offset and the robot arced. 80 PWM of
+// integral authority (~a third of full drive range) covers that while
+// still bounding windup.
+const float INTEGRAL_PWM_LIMIT = 80.0f;
+
 struct WheelPID {
   static const uint8_t GL_MEMORY_LENGTH = 20;
 
@@ -213,7 +237,10 @@ struct WheelPID {
 
     const float shapedForIntegral = glShape(lambda - 1.0f, pow(dt, 1.0f - lambda));
     integral += shapedForIntegral * dt;
-    integral = constrain(integral, -500.0f, 500.0f);
+    if (ki > 1e-6f) {
+      const float integralLimit = INTEGRAL_PWM_LIMIT / ki;
+      integral = constrain(integral, -integralLimit, integralLimit);
+    }
 
     const float shapedForDerivative = glShape(mu - 1.0f, pow(dt, 1.0f - mu));
     const float derivative = (shapedForDerivative - previousShapedError) / dt;
@@ -302,7 +329,14 @@ float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float magnitude = fabs(targetMMs);
   if (magnitude < 1.0f) return 0.0f;
 
-  const float pwm = (magnitude - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  // Direction-specific fit: the forward and reverse PWM-to-speed curves of
+  // these gearmotors differ per wheel, so picking the fit by sign is what
+  // keeps a straight-line command straight in BOTH directions.
+  const float slope = (targetMMs >= 0.0f) ? FF_SLOPE_MM_S_PER_PWM[motorIndex]
+                                          : FF_SLOPE_MM_S_PER_PWM_REV[motorIndex];
+  const float intercept = (targetMMs >= 0.0f) ? FF_INTERCEPT_MM_S[motorIndex]
+                                              : FF_INTERCEPT_MM_S_REV[motorIndex];
+  const float pwm = (magnitude - intercept) / slope;
   return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
