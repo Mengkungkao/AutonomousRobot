@@ -157,12 +157,14 @@ const float STEADY_ERROR_COST_WEIGHT = 6.0f;
 const float NO_RISE_PENALTY = 5000.0f;
 const float CONVERGENCE_THRESHOLD = 0.001f;   // sum of deltas below this stops early
 
-// Start the search from the production sketch's shared baseline gains.
-// lambda/mu start at 1.0 (classic PID) and let twiddle explore the
-// fractional-order space from there.
+// Start the search P-only (ki=kd=0) rather than from a preset PID baseline,
+// so twiddle has to earn any integral/derivative action from a clean
+// proportional-only starting point instead of inheriting it. lambda/mu
+// start at 1.0 (classic PID) and let twiddle explore the fractional-order
+// space from there.
 const float INITIAL_KP = 0.25f;
-const float INITIAL_KI = 0.034f;
-const float INITIAL_KD = 0.003f;
+const float INITIAL_KI = 0.0f;
+const float INITIAL_KD = 0.0f;
 const float INITIAL_LAMBDA = 1.0f;
 const float INITIAL_MU = 1.0f;
 const float INITIAL_DELTA_KP = 0.05f;
