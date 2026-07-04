@@ -94,4 +94,11 @@ struct TrialResult {
   bool aborted;
 };
 
+// Result of one open-loop PWM step in CALIBRATE: steady-state speed measured
+// at a fixed, directly-commanded PWM (no PID correction).
+struct CalStepResult {
+  float measuredMMs;
+  bool aborted;
+};
+
 #endif

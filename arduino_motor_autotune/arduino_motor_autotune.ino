@@ -14,12 +14,12 @@
   PID struct, feed-forward curve and constants as the production sketch, so
   results are meant to be pasted straight back into it.
 
-  SAFETY: lift all four wheels off the ground before running AUTOTUNE.
-  Each trial repeatedly drives one wheel up to the target speed; on the
-  ground the robot will crawl into whatever is in front of it. Also note
-  motor 4 has noticeably harder/higher-torque gearing than the other three,
-  so it keeps drifting for longer after RELEASE -- that's why trials brake
-  (not release) between runs (see REST_DURATION_MS/brakeMotor below).
+  SAFETY: lift all four wheels off the ground before running AUTOTUNE or
+  CALIBRATE. Each trial repeatedly drives one wheel up to the target speed;
+  on the ground the robot will crawl into whatever is in front of it. Also
+  note motor 4 has noticeably harder/higher-torque gearing than the other
+  three, so it keeps drifting for longer after RELEASE -- that's why trials
+  brake (not release) between runs (see REST_DURATION_MS/brakeMotor below).
 
   Hardware: QGPMaker motor shield + four QGPMaker quadrature encoders.
   No IMU is used by this tool.
@@ -33,8 +33,18 @@
       Defaults: target_mm_s=220, iterations=8. Prints a TRIAL line per step
       test and a RESULT line with the final gains when done. Only the
       chosen motor moves.
+    CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>]]
+      Open-loop (no PID) PWM sweep from MIN_EFFECTIVE_PWM to MAX_DRIVE_PWM
+      on one motor, step size pwm_step, holding each step for hold_ms and
+      measuring steady-state speed from the encoder. Reports each step's
+      speed against the speed the production feed-forward curve
+      (speedFeedForwardPWM) would assume for that PWM, so the gap between
+      assumed and real per-motor response is visible directly -- basic
+      ground truth for how accurately open-loop control can place that
+      wheel's speed before PID correction ever engages. Defaults:
+      pwm_step=20, hold_ms=1000. Only the chosen motor moves.
     STOP / ESTOP
-      Aborts any running autotune run and releases all motors.
+      Aborts any running autotune/calibration run and releases all motors.
     PING
       Replies PONG.
 
@@ -45,6 +55,13 @@
       Send TEST_CMD's payload verbatim to the production firmware's serial
       port to try the gains live (without reflashing) before committing
       them to arduino_ros2_base_controller.ino.
+
+  Output after each CALIBRATE step:
+    CAL,motor=<n>,pwm=...,measured_mm_s=...,expected_mm_s=...,
+      error_mm_s=...,error_pct=...
+      expected_mm_s is what speedFeedForwardPWM's linear PWM-to-speed
+      assumption predicts for that PWM; error_mm_s/error_pct is
+      measured_mm_s's deviation from it. Ends with INFO,CALIBRATE_DONE.
 */
 
 #include <Wire.h>
@@ -140,6 +157,16 @@ const float MAX_MU = 1.4f;
 
 // Number of tuned parameters per wheel: kp, ki, kd, lambda, mu.
 const uint8_t PARAM_COUNT = 5;
+
+// -----------------------------------------------------------------------------
+// CALIBRATE tuning knobs
+// -----------------------------------------------------------------------------
+
+const uint8_t DEFAULT_CAL_PWM_STEP = 20;
+const uint16_t DEFAULT_CAL_HOLD_MS = 1000;
+// Last fraction of each step's hold used for the steady-state speed average,
+// same idea as STEADY_WINDOW_FRACTION above.
+const float CAL_STEADY_WINDOW_FRACTION = 0.3f;
 
 // -----------------------------------------------------------------------------
 // Hardware
@@ -493,6 +520,114 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint8_t maxIterations) {
 }
 
 // -----------------------------------------------------------------------------
+// CALIBRATE: open-loop PWM sweep and error reporting
+//
+// Drives one motor directly at a fixed PWM (no PID) and measures the speed
+// it actually settles at. This is ground truth for how much the production
+// feed-forward curve's linear PWM<->speed assumption (speedFeedForwardPWM)
+// diverges from a given motor's real response -- basic error data for
+// judging how accurately that motor can be controlled open-loop before PID
+// correction ever engages.
+// -----------------------------------------------------------------------------
+
+CalStepResult runCalibrationStep(uint8_t motorIndex, uint8_t pwm, uint16_t holdMs) {
+  CalStepResult result = {0.0f, false};
+
+  readEncoderAndResetAtomic(motorIndex);
+  float filteredSpeed = 0.0f;
+  applyMotorOutputForward(motorIndex, pwm);
+
+  const uint32_t start = millis();
+  uint32_t last = start;
+
+  float steadySum = 0.0f;
+  uint32_t steadyCount = 0;
+  const uint32_t steadyStartMs = (uint32_t)(holdMs * (1.0f - CAL_STEADY_WINDOW_FRACTION));
+
+  while (millis() - start < holdMs) {
+    if (pollAbort()) {
+      result.aborted = true;
+      break;
+    }
+
+    uint32_t now = millis();
+    if (now - last >= CONTROL_PERIOD_MS) {
+      float dt = (now - last) * 0.001f;
+      last = now;
+      dt = constrain(dt, 0.005f, 0.050f);
+
+      const int32_t rawTicks = readEncoderAndResetAtomic(motorIndex);
+      const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex];
+      const float rawSpeed = (signedTicks * MM_PER_COUNT[motorIndex]) / dt;
+      filteredSpeed += 0.35f * (rawSpeed - filteredSpeed);
+
+      const uint32_t elapsedMs = now - start;
+      if (elapsedMs >= steadyStartMs) {
+        steadySum += filteredSpeed;
+        ++steadyCount;
+      }
+    }
+  }
+
+  brakeMotor(motorIndex);
+  result.measuredMMs = (steadyCount > 0) ? (steadySum / steadyCount) : filteredSpeed;
+
+  if (!result.aborted) {
+    const uint32_t restStart = millis();
+    while (millis() - restStart < REST_DURATION_MS) {
+      if (pollAbort()) {
+        result.aborted = true;
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+void runCalibration(uint8_t motorIndex, uint8_t pwmStep, uint16_t holdMs) {
+  abortRequested = false;
+  releaseAllMotors();
+
+  Serial.print(F("INFO,CALIBRATE_START,motor="));
+  Serial.print(motorIndex + 1);
+  Serial.print(F(",pwm_step="));
+  Serial.print(pwmStep);
+  Serial.print(F(",hold_ms="));
+  Serial.println(holdMs);
+
+  for (uint16_t pwm = MIN_EFFECTIVE_PWM; pwm <= MAX_DRIVE_PWM; pwm += pwmStep) {
+    CalStepResult step = runCalibrationStep(motorIndex, (uint8_t)pwm, holdMs);
+    if (step.aborted) {
+      finishAborted();
+      return;
+    }
+
+    const float expectedMMs =
+      ((float)pwm - MIN_EFFECTIVE_PWM) / (MAX_DRIVE_PWM - MIN_EFFECTIVE_PWM) * MAX_WHEEL_MM_S;
+    const float errorMMs = step.measuredMMs - expectedMMs;
+    const float errorPct = (expectedMMs > 1.0f) ? (errorMMs / expectedMMs * 100.0f) : 0.0f;
+
+    Serial.print(F("CAL,motor="));
+    Serial.print(motorIndex + 1);
+    Serial.print(F(",pwm="));
+    Serial.print(pwm);
+    Serial.print(F(",measured_mm_s="));
+    Serial.print(step.measuredMMs, 2);
+    Serial.print(F(",expected_mm_s="));
+    Serial.print(expectedMMs, 2);
+    Serial.print(F(",error_mm_s="));
+    Serial.print(errorMMs, 2);
+    Serial.print(F(",error_pct="));
+    Serial.println(errorPct, 1);
+  }
+
+  releaseAllMotors();
+  Serial.print(F("INFO,CALIBRATE_DONE,motor="));
+  Serial.println(motorIndex + 1);
+}
+
+// -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
 
@@ -524,6 +659,25 @@ void processCommand(char *line) {
     if (iterations > MAX_ITERATIONS_ALLOWED) iterations = MAX_ITERATIONS_ALLOWED;
 
     runAutotune((uint8_t)(motorNum - 1), targetMMs, (uint8_t)iterations);
+  }
+  else if (strcmp(command, "CALIBRATE") == 0) {
+    char *motorText = strtok_r(NULL, ",", &savePtr);
+    char *stepText = strtok_r(NULL, ",", &savePtr);
+    char *holdText = strtok_r(NULL, ",", &savePtr);
+
+    int motorNum = motorText ? atoi(motorText) : -1;
+    if (motorNum < 1 || motorNum > MOTOR_COUNT) {
+      Serial.println(F("ERR,CALIBRATE_FORMAT,expected_CALIBRATE_motor_1to4"));
+      return;
+    }
+
+    int pwmStep = stepText ? atoi(stepText) : DEFAULT_CAL_PWM_STEP;
+    if (pwmStep < 1) pwmStep = DEFAULT_CAL_PWM_STEP;
+
+    uint16_t holdMs = holdText ? (uint16_t)atoi(holdText) : DEFAULT_CAL_HOLD_MS;
+    if (holdMs < 100) holdMs = DEFAULT_CAL_HOLD_MS;
+
+    runCalibration((uint8_t)(motorNum - 1), (uint8_t)pwmStep, holdMs);
   }
   else if (strcmp(command, "STOP") == 0 || strcmp(command, "ESTOP") == 0) {
     releaseAllMotors();
