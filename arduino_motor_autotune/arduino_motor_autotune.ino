@@ -30,7 +30,7 @@
   Commands:
     AUTOTUNE,<motor 1-4>[,<target_mm_s>[,<iterations>]]
       Runs the single-motor autotune search over kp,ki,kd,lambda,mu.
-      Defaults: target_mm_s=90, iterations=8. Prints a TRIAL line per step
+      Defaults: target_mm_s=220, iterations=8. Prints a TRIAL line per step
       test and a RESULT line with the final gains when done. Only the
       chosen motor moves.
     MATCH,[<target_mm_s>[,<accel_mm_s2>[,<max_wheel_mm_s>[,<hold_ms>[,<rounds>]]]]]
@@ -39,8 +39,8 @@
       each motor's kp,ki,kd,lambda,mu to minimise its speed-vs-time AND
       final-distance divergence from the other three -- i.e. matched
       acceleration, speed, timing and distance, not just an accurate
-      individual step response. Defaults: target_mm_s=90, accel_mm_s2=150,
-      max_wheel_mm_s=200, hold_ms=1000, rounds=6. Seeds from the per-motor
+      individual step response. Defaults: target_mm_s=220, accel_mm_s2=150,
+      max_wheel_mm_s=250, hold_ms=1000, rounds=6. Seeds from the per-motor
       gains already found by AUTOTUNE (see MATCH_SEED_GAINS below) rather
       than starting fresh.
     STOP / ESTOP
@@ -116,7 +116,7 @@ const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 // Autotune tuning knobs
 // -----------------------------------------------------------------------------
 
-const float DEFAULT_TARGET_MM_S = 90.0f;
+const float DEFAULT_TARGET_MM_S = 220.0f;
 const uint8_t DEFAULT_ITERATIONS = 8;
 const uint8_t MAX_ITERATIONS_ALLOWED = 30;
 
@@ -166,9 +166,9 @@ const uint8_t PARAM_COUNT = 5;
 // MATCH (group) tuning knobs
 // -----------------------------------------------------------------------------
 
-const float DEFAULT_MATCH_TARGET_MM_S = 90.0f;
+const float DEFAULT_MATCH_TARGET_MM_S = 220.0f;
 const float DEFAULT_MATCH_ACCEL_MM_S2 = 150.0f;
-const float DEFAULT_MATCH_MAX_WHEEL_MM_S = 200.0f;
+const float DEFAULT_MATCH_MAX_WHEEL_MM_S = 250.0f;
 const uint16_t DEFAULT_MATCH_HOLD_MS = 1000;
 const uint8_t DEFAULT_MATCH_ROUNDS = 6;
 const uint8_t MAX_MATCH_ROUNDS_ALLOWED = 15;
