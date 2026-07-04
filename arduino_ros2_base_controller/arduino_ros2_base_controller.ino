@@ -108,10 +108,16 @@ const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 // 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.
 const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
 
-// Keep all feed-forward scales equal initially. PID will independently correct
-// motor-to-motor differences. These can be adjusted later only if a motor reaches
-// integral saturation during steady driving.
-const float PWM_FEEDFORWARD_SCALE[MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+// Per-motor open-loop PWM-to-speed linear fit (measured_mm_s = slope*pwm +
+// intercept), from arduino_motor_autotune's CALIBRATE,<motor>,10,1000 sweep
+// (2026-07-04, PWM 48-208). Real motors diverge hugely from a single shared
+// curve -- motor 4 needs less than half the PWM of motors 2/3 for the same
+// speed -- so each motor gets its own inverse mapping in
+// speedFeedForwardPWM below instead of one shared ratio scaled by a
+// constant. Linear fit residual RMSE is ~15-27 mm/s (real response
+// saturates a bit at high PWM); PID still corrects the remainder.
+const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
 
 // MPU sign: a physical left turn must make ROS yaw increase. Set to -1.0 if the
 // yaw decreases during a left-turn test.
@@ -295,10 +301,8 @@ float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float magnitude = fabs(targetMMs);
   if (magnitude < 1.0f) return 0.0f;
 
-  float ratio = magnitude / MAX_WHEEL_MM_S;
-  ratio = constrain(ratio, 0.0f, 1.0f);
-  float pwm = MIN_EFFECTIVE_PWM + ratio * (MAX_DRIVE_PWM - MIN_EFFECTIVE_PWM);
-  return pwm * PWM_FEEDFORWARD_SCALE[motorIndex];
+  const float pwm = (magnitude - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
 void releaseAllMotors() {

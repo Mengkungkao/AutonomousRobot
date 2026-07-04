@@ -37,11 +37,12 @@
       Open-loop (no PID) PWM sweep from MIN_EFFECTIVE_PWM to MAX_DRIVE_PWM
       on one motor, step size pwm_step, holding each step for hold_ms and
       measuring steady-state speed from the encoder. Reports each step's
-      speed against the speed the production feed-forward curve
-      (speedFeedForwardPWM) would assume for that PWM, so the gap between
-      assumed and real per-motor response is visible directly -- basic
-      ground truth for how accurately open-loop control can place that
-      wheel's speed before PID correction ever engages. Defaults:
+      speed against what that motor's own calibrated feed-forward curve
+      (FF_SLOPE_MM_S_PER_PWM/FF_INTERCEPT_MM_S, used by
+      speedFeedForwardPWM) predicts for that PWM, so any remaining gap
+      -- e.g. from the real response saturating at high PWM, which a
+      straight-line fit doesn't capture -- is visible directly. Re-run
+      after updating those constants to check the new fit. Defaults:
       pwm_step=20, hold_ms=1000. Only the chosen motor moves.
     STOP / ESTOP
       Aborts any running autotune/calibration run and releases all motors.
@@ -107,6 +108,17 @@ const uint8_t MAX_DRIVE_PWM = 210;
 
 // Motor order: 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.
 const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
+
+// Per-motor open-loop PWM-to-speed linear fit (measured_mm_s = slope*pwm +
+// intercept), from a CALIBRATE,<motor>,10,1000 sweep (2026-07-04, PWM
+// 48-208). Keep in sync with arduino_ros2_base_controller.ino's copy of
+// the same constants -- real motors diverge hugely from a single shared
+// curve (motor 4 needs less than half the PWM of motors 2/3 for the same
+// speed), so each gets its own inverse mapping in speedFeedForwardPWM
+// below. Linear fit residual RMSE is ~15-27 mm/s (real response saturates
+// a bit at high PWM); PID still corrects the remainder.
+const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
 
 // -----------------------------------------------------------------------------
 // Autotune tuning knobs
@@ -227,9 +239,9 @@ void applyMotorOutputForward(uint8_t index, float magnitudePWM) {
   m->setSpeed(pwm);
 }
 
-float speedFeedForwardPWM(float targetMMs, float maxWheelMMs) {
-  float ratio = constrain(targetMMs / maxWheelMMs, 0.0f, 1.0f);
-  return MIN_EFFECTIVE_PWM + ratio * (MAX_DRIVE_PWM - MIN_EFFECTIVE_PWM);
+float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
+  const float pwm = (targetMMs - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
 // -----------------------------------------------------------------------------
@@ -318,7 +330,7 @@ TrialResult runStepTrial(uint8_t motorIndex, float targetMMs) {
 
       const float error = targetMMs - filteredSpeed;
       const float correction = wheelPID[motorIndex].update(targetMMs, filteredSpeed, dt);
-      const float feedForward = speedFeedForwardPWM(targetMMs, MAX_WHEEL_MM_S);
+      const float feedForward = speedFeedForwardPWM(targetMMs, motorIndex);
       const float out = constrain(feedForward + correction, 0.0f, 255.0f);
       applyMotorOutputForward(motorIndex, out);
 
@@ -604,7 +616,7 @@ void runCalibration(uint8_t motorIndex, uint8_t pwmStep, uint16_t holdMs) {
     }
 
     const float expectedMMs =
-      ((float)pwm - MIN_EFFECTIVE_PWM) / (MAX_DRIVE_PWM - MIN_EFFECTIVE_PWM) * MAX_WHEEL_MM_S;
+      FF_SLOPE_MM_S_PER_PWM[motorIndex] * (float)pwm + FF_INTERCEPT_MM_S[motorIndex];
     const float errorMMs = step.measuredMMs - expectedMMs;
     const float errorPct = (expectedMMs > 1.0f) ? (errorMMs / expectedMMs * 100.0f) : 0.0f;
 
