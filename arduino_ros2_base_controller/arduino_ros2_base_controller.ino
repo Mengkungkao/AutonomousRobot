@@ -106,8 +106,8 @@ const uint8_t MAX_DRIVE_PWM = 210;
 const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 
 // Motor order used throughout this sketch and the ROS URDF:
-// 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.
-const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
+// 1 front-right, 2 front-left, 3 rear-left, 4 rear-right.
+const bool LEFT_SIDE[MOTOR_COUNT] = {false, true, true, false};
 
 // Per-motor, per-direction open-loop PWM-to-speed linear fit
 // (|measured_mm_s| = slope*pwm + intercept). Forward coefficients are from
@@ -129,9 +129,11 @@ const float FF_INTERCEPT_MM_S_FWD[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6
 const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.4662f, 2.1564f, 1.9853f, 2.5093f};
 const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-118.32f, -86.97f, -92.43f, -104.95f};
 
-// MPU sign: a physical left turn must make ROS yaw increase. Set to -1.0 if the
-// yaw decreases during a left-turn test.
-const float IMU_YAW_SIGN = 1.0f;
+// MPU sign: a physical left turn must make ROS yaw increase (REP-103,
+// CCW-positive). This MPU reports clockwise-positive (hand left-turn test read
+// -50 deg), so the sign is flipped here. Set back to 1.0 only if a left-turn
+// test shows yaw decreasing again after a hardware change.
+const float IMU_YAW_SIGN = -1.0f;
 
 // -----------------------------------------------------------------------------
 // Hardware

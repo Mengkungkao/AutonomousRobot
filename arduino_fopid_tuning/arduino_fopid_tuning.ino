@@ -215,9 +215,9 @@ const float MAX_WHEEL_MM_S = 250.0f;   // matches production MAX_WHEEL_MM_S
 const uint8_t MIN_EFFECTIVE_PWM = 50;
 const uint8_t MAX_DRIVE_PWM = 210;
 
-// Motor order: 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.
+// Motor order: 1 front-right, 2 front-left, 3 rear-left, 4 rear-right.
 const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
-const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
+const bool LEFT_SIDE[MOTOR_COUNT] = {false, true, true, false};
 
 // Per-motor, per-direction open-loop PWM-to-speed linear fit
 // (|measured_mm_s| = slope*pwm + intercept). Keep in sync with

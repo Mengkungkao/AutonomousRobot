@@ -360,11 +360,12 @@ class SerialBridge(Node):
         # rim speed (mm/s) -> angular velocity (rad/s).
         joint = JointState()
         joint.header.stamp = stamp
+        # Order matches the Arduino motor numbering: 1 FR, 2 FL, 3 RL, 4 RR.
         joint.name = [
-            'front_left_wheel_joint',
             'front_right_wheel_joint',
-            'rear_right_wheel_joint',
+            'front_left_wheel_joint',
             'rear_left_wheel_joint',
+            'rear_right_wheel_joint',
         ]
         radians_per_tick = 2.0 * math.pi / self.counts_per_rev
         joint.position = [tick * radians_per_tick for tick in data.ticks]
