@@ -14,6 +14,9 @@ def generate_launch_description():
     slam = get_package_share_directory('slam_toolbox')
     params = os.path.join(share, 'config', 'nav2_params.yaml')
     slam_params = os.path.join(share, 'config', 'slam_toolbox.yaml')
+    # Custom RViz view: nav2 default plus the mdetect Goto panel
+    # (type x_mm,y_mm,heading_deg to send the robot to a map coordinate).
+    rviz_config = os.path.join(share, 'config', 'mdetect_view.rviz')
 
     slam_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(slam, 'launch', 'online_async_launch.py')),
@@ -24,7 +27,7 @@ def generate_launch_description():
                           'autostart': 'true', 'use_composition': 'False'}.items())
     rviz = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(nav2, 'launch', 'rviz_launch.py')),
-        launch_arguments={'use_sim_time': 'false'}.items())
+        launch_arguments={'use_sim_time': 'false', 'rviz_config': rviz_config}.items())
 
     return LaunchDescription([
         navigation,

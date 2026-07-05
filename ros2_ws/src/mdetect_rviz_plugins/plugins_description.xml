@@ -1,0 +1,10 @@
+<library path="mdetect_rviz_plugins">
+  <class name="mdetect_rviz_plugins/GotoPanel"
+         type="mdetect_rviz_plugins::GotoPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Command-line style goto panel: type x_mm,y_mm,heading_deg (e.g.
+      1000,1000,90) and the robot drives there via Nav2 NavigateToPose.
+    </description>
+  </class>
+</library>

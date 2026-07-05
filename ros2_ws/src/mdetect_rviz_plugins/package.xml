@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mdetect_rviz_plugins</name>
+  <version>1.0.0</version>
+  <description>RViz panels for the mDetect robot: Goto panel that sends
+    x_mm,y_mm,heading_deg targets to Nav2's NavigateToPose action.</description>
+  <maintainer email="meng@example.com">Meng Kung Kao</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rviz_common</depend>
+  <depend>nav2_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>pluginlib</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

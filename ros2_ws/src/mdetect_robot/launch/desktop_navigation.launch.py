@@ -13,6 +13,9 @@ def generate_launch_description():
     share = get_package_share_directory('mdetect_robot')
     nav2 = get_package_share_directory('nav2_bringup')
     params = os.path.join(share, 'config', 'nav2_params.yaml')
+    # Custom RViz view: nav2 default plus the mdetect Goto panel
+    # (type x_mm,y_mm,heading_deg to send the robot to a map coordinate).
+    rviz_config = os.path.join(share, 'config', 'mdetect_view.rviz')
     map_arg = LaunchConfiguration('map')
 
     localization = IncludeLaunchDescription(
@@ -25,7 +28,7 @@ def generate_launch_description():
                           'autostart': 'true', 'use_composition': 'False'}.items())
     rviz = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(nav2, 'launch', 'rviz_launch.py')),
-        launch_arguments={'use_sim_time': 'false'}.items())
+        launch_arguments={'use_sim_time': 'false', 'rviz_config': rviz_config}.items())
 
     return LaunchDescription([
         DeclareLaunchArgument('map', description='Absolute path to saved map YAML'),
