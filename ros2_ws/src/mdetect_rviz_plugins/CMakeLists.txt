@@ -23,6 +23,8 @@ set(CMAKE_AUTOMOC ON)
 add_library(${PROJECT_NAME} SHARED
   src/goto_panel.cpp
   src/goto_panel.hpp
+  src/teleop_panel.cpp
+  src/teleop_panel.hpp
 )
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp

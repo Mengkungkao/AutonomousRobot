@@ -7,4 +7,13 @@
       1000,1000,90) and the robot drives there via Nav2 NavigateToPose.
     </description>
   </class>
+  <class name="mdetect_rviz_plugins/TeleopPanel"
+         type="mdetect_rviz_plugins::TeleopPanel"
+         base_class_type="rviz_common::Panel">
+    <description>
+      Teleop panel with an on/off toggle: while on, hold W/A/S/D (or the
+      on-screen buttons) to stream /cmd_vel_teleop; idle or off gives
+      control back to Nav2 through the cmd_mux.
+    </description>
+  </class>
 </library>
