@@ -344,9 +344,12 @@ ros2 run mdetect_robot teleop_keyboard \
   --ros-args --remap cmd_vel:=/cmd_vel_teleop
 ```
 
-Keys: `w`/`s` forward/backward, `a`/`d` rotate left/right, `,`/`.` scale both
-speeds by 10%, `-`/`+` scale linear speed only, `[`/`]` scale angular speed
-only. Any other key stops the robot.
+Keys: `w`/`s` forward/backward, `a`/`d` rotate left/right — hold a key to
+move, release to stop. Any other key stops the robot immediately. While a key
+is held the node streams the command at ~20 Hz so the mux never falls back to
+a lower-priority source (e.g. Nav2) mid-drive; after ~0.75 s without a
+keypress it publishes a final stop and goes silent. Speeds are set with the
+`speed` (m/s) and `turn` (rad/s) parameters.
 
 Emergency stop:
 
