@@ -1,3 +1,6 @@
+# Desktop-side navigation on a previously saved map: Nav2 localization (AMCL
+# + map server, using the required 'map' argument), the navigation stack, and
+# RViz. Run alongside robot.launch.py on the robot.
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription

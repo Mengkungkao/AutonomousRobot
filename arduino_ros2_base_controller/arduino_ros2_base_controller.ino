@@ -109,16 +109,25 @@ const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 // 1 front-left, 2 front-right, 3 rear-right, 4 rear-left.
 const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
 
-// Per-motor open-loop PWM-to-speed linear fit (measured_mm_s = slope*pwm +
-// intercept), from arduino_motor_autotune's CALIBRATE,<motor>,10,1000 sweep
-// (2026-07-04, PWM 48-208). Real motors diverge hugely from a single shared
-// curve -- motor 4 needs less than half the PWM of motors 2/3 for the same
-// speed -- so each motor gets its own inverse mapping in
-// speedFeedForwardPWM below instead of one shared ratio scaled by a
-// constant. Linear fit residual RMSE is ~15-27 mm/s (real response
-// saturates a bit at high PWM); PID still corrects the remainder.
-const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
-const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+// Per-motor, per-direction open-loop PWM-to-speed linear fit
+// (|measured_mm_s| = slope*pwm + intercept). Forward coefficients are from
+// arduino_motor_calibration's CALIBRATE,<motor>,10,1000 sweep (2026-07-04,
+// PWM 48-208). Real motors diverge hugely from a single shared curve --
+// motor 4 needs less than half the PWM of motors 2/3 for the same speed --
+// so each motor gets its own inverse mapping in speedFeedForwardPWM below.
+// Brushed gearmotors are also direction-asymmetric, which showed up on the
+// robot as forward driving straight while reverse drifted, so reverse gets
+// its own fit from a CALIBRATE,<motor>,10,1000,R sweep. Linear fit residual
+// RMSE is ~15-27 mm/s (real response saturates a bit at high PWM); PID
+// still corrects the remainder.
+const float FF_SLOPE_MM_S_PER_PWM_FWD[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S_FWD[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+// Reverse fit from CALIBRATE,<motor>,10,1000,R sweeps (2026-07-05, PWM
+// 50-210, stalled deadband points excluded). Very different from forward
+// -- e.g. motor 4 needs PWM ~130 for 220 mm/s in reverse vs ~91 forward --
+// which is what made the robot drift when backing up. RMSE 5-17 mm/s.
+const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.4662f, 2.1564f, 1.9853f, 2.5093f};
+const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-118.32f, -86.97f, -92.43f, -104.95f};
 
 // MPU sign: a physical left turn must make ROS yaw increase. Set to -1.0 if the
 // yaw decreases during a left-turn test.
@@ -213,7 +222,18 @@ struct WheelPID {
 
     const float shapedForIntegral = glShape(lambda - 1.0f, pow(dt, 1.0f - lambda));
     integral += shapedForIntegral * dt;
-    integral = constrain(integral, -500.0f, 500.0f);
+    // Anti-windup: cap the integral by its output contribution (ki*integral,
+    // in PWM), not a fixed error-seconds bound. The old +/-500 cap allowed
+    // only ~1.5-4 PWM of trim at ki~0.003-0.008, so feed-forward error could
+    // never be integrated away -- wheels plateaued off-target no matter how
+    // long they ran.
+    const float MAX_INTEGRAL_PWM = 80.0f;
+    if (ki > 0.0001f) {
+      const float limit = MAX_INTEGRAL_PWM / ki;
+      integral = constrain(integral, -limit, limit);
+    } else {
+      integral = constrain(integral, -500.0f, 500.0f);
+    }
 
     const float shapedForDerivative = glShape(mu - 1.0f, pow(dt, 1.0f - mu));
     const float derivative = (shapedForDerivative - previousShapedError) / dt;
@@ -261,10 +281,13 @@ uint8_t commandLength = 0;
 // Helpers
 // -----------------------------------------------------------------------------
 
+// Map 0-based motor index to the shield's 1-based motor ports.
 QGPMaker_DCMotor *getMotor(uint8_t index) {
   return motorShield.getMotor(index + 1);
 }
 
+// Read the tick delta since the previous call and clear the counter, with
+// interrupts disabled so the ISR cannot update the count mid-read.
 int32_t readEncoderAndResetAtomic(uint8_t index) {
   noInterrupts();
   int32_t value;
@@ -278,6 +301,8 @@ int32_t readEncoderAndResetAtomic(uint8_t index) {
   return value;
 }
 
+// Discard any pending encoder ticks and clear the speed estimates, so stale
+// counts don't produce a velocity spike on the next control cycle.
 void resetEncoderDeltas() {
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     readEncoderAndResetAtomic(i);
@@ -286,26 +311,38 @@ void resetEncoderDeltas() {
   }
 }
 
+// Wrap an angle into (-180, 180] degrees.
 float normalizeDegrees(float angle) {
   while (angle > 180.0f) angle -= 360.0f;
   while (angle < -180.0f) angle += 360.0f;
   return angle;
 }
 
+// Step 'current' toward 'target' by at most 'maximumStep' — the slew-rate
+// limiter used for the acceleration ramps.
 float moveToward(float current, float target, float maximumStep) {
   if (current < target) return min(current + maximumStep, target);
   if (current > target) return max(current - maximumStep, target);
   return current;
 }
 
+// Invert the per-motor, per-direction PWM-to-speed linear fit to get the
+// open-loop PWM expected to produce the target speed; PID then only has to
+// correct the residual. Returns an unsigned PWM magnitude.
 float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float magnitude = fabs(targetMMs);
   if (magnitude < 1.0f) return 0.0f;
 
-  const float pwm = (magnitude - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  const bool reverse = targetMMs < 0.0f;
+  const float slope = reverse ? FF_SLOPE_MM_S_PER_PWM_REV[motorIndex]
+                              : FF_SLOPE_MM_S_PER_PWM_FWD[motorIndex];
+  const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
+                                  : FF_INTERCEPT_MM_S_FWD[motorIndex];
+  const float pwm = (magnitude - intercept) / slope;
   return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
+// Stop with motors freewheeling (coast) and clear all controller state.
 void releaseAllMotors() {
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     QGPMaker_DCMotor *m = getMotor(i);
@@ -317,6 +354,7 @@ void releaseAllMotors() {
   }
 }
 
+// Stop with active braking (motor terminals shorted) — used for e-stop.
 void brakeAllMotors() {
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     QGPMaker_DCMotor *m = getMotor(i);
@@ -328,6 +366,9 @@ void brakeAllMotors() {
   }
 }
 
+// Drive one motor with a signed PWM value: sign selects direction (taken from
+// the wheel target), magnitude sets duty. Near-zero target or output releases
+// the motor instead of stalling it at a tiny PWM.
 void applyMotorOutput(uint8_t index, float signedPWM) {
   if (fabs(wheelTargetMMs[index]) < 1.0f || fabs(signedPWM) < 1.0f) {
     QGPMaker_DCMotor *m = getMotor(index);
@@ -348,6 +389,8 @@ void applyMotorOutput(uint8_t index, float signedPWM) {
   wheelPWM[index] = (wheelTargetMMs[index] >= 0.0f) ? pwm : -((float)pwm);
 }
 
+// Accept a new body-velocity setpoint (clamped to limits) and feed the
+// command watchdog.
 void setVelocityCommand(float linearMMs, float angularDegS) {
   commandLinearMMs = constrain(linearMMs, -MAX_LINEAR_MM_S, MAX_LINEAR_MM_S);
   commandAngularDegS = constrain(angularDegS, -MAX_ANGULAR_DEG_S, MAX_ANGULAR_DEG_S);
@@ -355,6 +398,7 @@ void setVelocityCommand(float linearMMs, float angularDegS) {
   watchdogStopped = false;
 }
 
+// Zero the setpoints and ramps, then stop the motors (brake or coast).
 void stopCommand(bool brake) {
   commandLinearMMs = 0.0f;
   commandAngularDegS = 0.0f;
@@ -364,6 +408,7 @@ void stopCommand(bool brake) {
   else releaseAllMotors();
 }
 
+// Zero the integrated pose, tick totals, and yaw reference.
 void resetOdometry() {
   poseXMM = 0.0f;
   poseYMM = 0.0f;
@@ -374,6 +419,8 @@ void resetOdometry() {
   yawDeg = 0.0f;
 }
 
+// Make the current heading the new zero by capturing the IMU's absolute
+// integrated angle as the reference offset.
 void zeroYaw() {
   yawZeroDeg = IMU_YAW_SIGN * mpu6050.getAngleZ();
   yawDeg = 0.0f;
@@ -387,6 +434,8 @@ void printReady() {
   Serial.println(F("READY,mDetect_ROS2_low_level_v1"));
 }
 
+// Parse and execute one complete command line (see header comment for the
+// command set). Tokenizes in place with strtok_r and replies with ACK/ERR.
 void processCommand(char *line) {
   char *savePtr = NULL;
   char *command = strtok_r(line, ",", &savePtr);
@@ -503,6 +552,8 @@ void processCommand(char *line) {
   }
 }
 
+// Accumulate serial bytes into commandBuffer and dispatch a command whenever
+// a terminator (\n, \r or ':') arrives. Oversized lines are discarded.
 void readSerialCommands() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -525,12 +576,17 @@ void readSerialCommands() {
 // Control and odometry
 // -----------------------------------------------------------------------------
 
+// Refresh yaw angle (relative to the zero reference) and yaw rate from the
+// MPU6050's integrated gyro.
 void updateIMU() {
   mpu6050.update();
   yawDeg = normalizeDegrees(IMU_YAW_SIGN * mpu6050.getAngleZ() - yawZeroDeg);
   yawRateDegS = IMU_YAW_SIGN * mpu6050.getGyroZ();
 }
 
+// 100 Hz control step: watchdog/e-stop handling, acceleration ramps,
+// differential-drive kinematics, per-wheel feed-forward + PID, and odometry
+// integration (encoder distance + IMU heading).
 void updateControl(float dt) {
   // Communication loss is always handled locally on the Arduino.
   if (!emergencyStopLatched && millis() - lastCommandMs > COMMAND_WATCHDOG_MS) {
@@ -543,6 +599,7 @@ void updateControl(float dt) {
     return;
   }
 
+  // Slew-limit the commanded velocities so wheel targets change smoothly.
   rampedLinearMMs = moveToward(
     rampedLinearMMs,
     commandLinearMMs,
@@ -554,6 +611,7 @@ void updateControl(float dt) {
     ANGULAR_ACCEL_DEG_S2 * dt
   );
 
+  // Differential-drive kinematics: body (v, w) -> left/right wheel rim speeds.
   const float angularRadS = rampedAngularDegS * DEG_TO_RAD;
   const float leftTarget = rampedLinearMMs - angularRadS * TRACK_WIDTH_MM * 0.5f;
   const float rightTarget = rampedLinearMMs + angularRadS * TRACK_WIDTH_MM * 0.5f;
@@ -564,6 +622,7 @@ void updateControl(float dt) {
   uint8_t rightCount = 0;
 
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+    // Measure this cycle's travel from the encoder tick delta.
     const int32_t rawTicks = readEncoderAndResetAtomic(i);
     const int32_t signedTicks = rawTicks * ENCODER_SIGN[i];
     cumulativeTicks[i] += signedTicks;
@@ -585,6 +644,9 @@ void updateControl(float dt) {
       wheelTargetMMs[i] = constrain(rightTarget, -MAX_WHEEL_MM_S, MAX_WHEEL_MM_S);
     }
 
+    // Output = open-loop feed-forward + PID correction. The correction is
+    // flipped for reverse targets because the PID works in signed speed while
+    // the output here is a magnitude.
     const float feedForward = speedFeedForwardPWM(wheelTargetMMs[i], i);
     const float correction = wheelPID[i].update(wheelTargetMMs[i], wheelMeasuredMMs[i], dt);
     float outputMagnitude = feedForward + ((wheelTargetMMs[i] >= 0.0f) ? correction : -correction);
@@ -592,6 +654,8 @@ void updateControl(float dt) {
     applyMotorOutput(i, (wheelTargetMMs[i] >= 0.0f) ? outputMagnitude : -outputMagnitude);
   }
 
+  // Odometry: average per-side wheel travel, take the body-centre distance,
+  // and integrate along the IMU heading (encoder distance + gyro yaw fusion).
   if (leftCount > 0) leftDistanceMM /= leftCount;
   if (rightCount > 0) rightDistanceMM /= rightCount;
   const float centreDistanceMM = 0.5f * (leftDistanceMM + rightDistanceMM);
@@ -602,6 +666,8 @@ void updateControl(float dt) {
   linearVelocityMMs = centreDistanceMM / dt;
 }
 
+// Emit one 'T,...' CSV telemetry line (field layout in the header comment);
+// consumed by the ROS 2 serial bridge.
 void publishTelemetry() {
   Serial.print(F("T,"));
   Serial.print(millis());
@@ -629,6 +695,8 @@ void publishTelemetry() {
 // Arduino setup/loop
 // -----------------------------------------------------------------------------
 
+// One-time init: serial link, I2C at 400 kHz, motor shield at 500 Hz PWM,
+// per-wheel PID gains, and IMU gyro calibration (robot must be still).
 void setup() {
   Serial.begin(SERIAL_BAUD);
   Wire.begin();
@@ -663,12 +731,16 @@ void setup() {
   printReady();
 }
 
+// Main loop: poll serial and IMU every pass; run control at 100 Hz and
+// telemetry at 20 Hz off millis() schedules.
 void loop() {
   readSerialCommands();
   updateIMU();
 
   const uint32_t now = millis();
   if (now - lastControlMs >= CONTROL_PERIOD_MS) {
+    // Use the true elapsed time, clamped so a hiccup can't blow up the
+    // integrator or derivative.
     float dt = (now - lastControlMs) * 0.001f;
     lastControlMs = now;
     dt = constrain(dt, 0.005f, 0.050f);

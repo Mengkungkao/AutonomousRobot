@@ -82,8 +82,11 @@ GAINS,motor=<n>,kp=...,ki=...,kd=...,lambda=...,mu=...
 
 ### `STEP,<motor 1-4>[,target_mm_s[,duration_ms]]`
 
-Single-wheel closed-loop dynamic step trial at `target_mm_s`. Defaults:
-`target_mm_s=220`, `duration_ms=1200`. Only the chosen motor moves.
+Single-wheel closed-loop dynamic step trial at `target_mm_s`. A negative
+`target_mm_s` runs the step in reverse (`SAMPLE` speeds print signed;
+`STEP_RESULT` metrics stay in magnitude terms so forward and reverse runs
+compare directly). Defaults: `target_mm_s=220`, `duration_ms=1200`. Only
+the chosen motor moves.
 
 Output per control tick:
 
@@ -104,6 +107,12 @@ Ends with `INFO,STEP_DONE,motor=<n>`.
 ### `MATCH[,target_mm_s[,duration_ms]]`
 
 Runs all four motors closed-loop at the same `target_mm_s` simultaneously.
+A negative `target_mm_s` runs the trial in reverse -- this is the check
+for backward straight-line driving, which has its own per-motor
+feed-forward curve (`FF_*_REV`) because brushed gearmotors are
+direction-asymmetric; a robot can MATCH well forward and still drift badly
+in reverse until the reverse curves are calibrated. Speeds print signed
+(all negative on a reverse trial); the mismatch metrics read the same way.
 Defaults: `target_mm_s=220`, `duration_ms=1200`. **All four motors move --
 wheels must be off the ground.**
 
@@ -264,7 +273,11 @@ Replies `PONG`.
    disagrees, that's `MEASURED_COUNTS_PER_REV` calibration error -- see the
    `ROTATE` command doc above. Repeat steps 2-3 for all four motors.
 4. Once all four look reasonable in isolation, run
-   `MATCH,<target_mm_s>` at your typical operating speed.
+   `MATCH,<target_mm_s>` at your typical operating speed. Then run
+   `MATCH,-<target_mm_s>` for the reverse direction -- reverse has its own
+   feed-forward curve (`FF_*_REV`, fit from `arduino_motor_calibration`'s
+   `CALIBRATE,...,R` sweeps), and a robot that matches well forward can
+   still drift in reverse if those curves haven't been calibrated yet.
 5. Read `left_right_diff_mm_s` and `spread_mm_s`. If one side is
    consistently faster, raise `kp`/`ki` slightly on the slower side's
    motor(s) (or lower it on the faster side) and re-run `MATCH` -- small
@@ -289,7 +302,8 @@ Replies `PONG`.
   loop continuously on live `/cmd_vel` commands; gains found here get
   pasted into its `setup()`.
 
-Keep the feed-forward constants (`FF_SLOPE_MM_S_PER_PWM`/`FF_INTERCEPT_MM_S`),
-encoder calibration (`MEASURED_COUNTS_PER_REV`), and the `WheelPID`
-implementation itself in sync across all three sketches manually -- there's
-no shared header between them.
+Keep the feed-forward constants (`FF_SLOPE_MM_S_PER_PWM_FWD/REV` +
+`FF_INTERCEPT_MM_S_FWD/REV`), encoder calibration
+(`MEASURED_COUNTS_PER_REV`), and the `WheelPID` implementation itself in
+sync across all three sketches manually -- there's no shared header
+between them.

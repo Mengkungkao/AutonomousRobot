@@ -72,12 +72,18 @@
     STEP,<motor 1-4>[,target_mm_s[,duration_ms]]
       Single-wheel closed-loop dynamic step trial (PID engaged) at
       target_mm_s, printing one SAMPLE line per 10ms control tick plus a
-      STEP_RESULT summary. Defaults: target_mm_s=220, duration_ms=1200.
-      Only the chosen motor moves.
+      STEP_RESULT summary. A negative target_mm_s runs the step in
+      reverse (SAMPLE speeds print signed; STEP_RESULT metrics stay in
+      magnitude terms so forward and reverse runs compare directly).
+      Defaults: target_mm_s=220, duration_ms=1200. Only the chosen motor
+      moves.
     MATCH[,target_mm_s[,duration_ms]]
       Runs all four motors closed-loop at the same target_mm_s
       simultaneously, printing one combined SAMPLE line per control tick
-      plus a MATCH_RESULT summary with cross-wheel mismatch metrics.
+      plus a MATCH_RESULT summary with cross-wheel mismatch metrics. A
+      negative target_mm_s runs the trial in reverse -- use this to check
+      straight-line matching for backward driving, which has its own
+      feed-forward curve (brushed gearmotors are direction-asymmetric).
       Defaults: target_mm_s=220, duration_ms=1200. All four motors move --
       wheels MUST be off the ground.
     POSGAIN[,<kp_pos>[,max_speed_mm_s]]
@@ -213,11 +219,16 @@ const uint8_t MAX_DRIVE_PWM = 210;
 const int8_t ENCODER_SIGN[MOTOR_COUNT] = {-1, 1, 1, -1};
 const bool LEFT_SIDE[MOTOR_COUNT] = {true, false, false, true};
 
-// Per-motor open-loop PWM-to-speed linear fit (measured_mm_s = slope*pwm +
-// intercept). Keep in sync with arduino_ros2_base_controller.ino's and
-// arduino_motor_calibration.ino's copies of the same constants.
-const float FF_SLOPE_MM_S_PER_PWM[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
-const float FF_INTERCEPT_MM_S[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+// Per-motor, per-direction open-loop PWM-to-speed linear fit
+// (|measured_mm_s| = slope*pwm + intercept). Keep in sync with
+// arduino_ros2_base_controller.ino's and arduino_motor_calibration.ino's
+// copies of the same constants.
+const float FF_SLOPE_MM_S_PER_PWM_FWD[MOTOR_COUNT] = {2.557f, 2.631f, 2.4945f, 2.3404f};
+const float FF_INTERCEPT_MM_S_FWD[MOTOR_COUNT] = {-83.25f, -143.56f, -149.38f, 6.14f};
+// Reverse fit from CALIBRATE,<motor>,10,1000,R sweeps (2026-07-05, PWM
+// 50-210, stalled deadband points excluded). RMSE 5-17 mm/s.
+const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.4662f, 2.1564f, 1.9853f, 2.5093f};
+const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-118.32f, -86.97f, -92.43f, -104.95f};
 
 // -----------------------------------------------------------------------------
 // Trial knobs
@@ -342,7 +353,18 @@ struct WheelPID {
 
     const float shapedForIntegral = glShape(lambda - 1.0f, pow(dt, 1.0f - lambda));
     integral += shapedForIntegral * dt;
-    integral = constrain(integral, -500.0f, 500.0f);
+    // Anti-windup: cap the integral by its output contribution (ki*integral,
+    // in PWM), not a fixed error-seconds bound. The old +/-500 cap allowed
+    // only ~1.5-4 PWM of trim at ki~0.003-0.008, so feed-forward error could
+    // never be integrated away -- wheels plateaued off-target no matter how
+    // long they ran.
+    const float MAX_INTEGRAL_PWM = 80.0f;
+    if (ki > 0.0001f) {
+      const float limit = MAX_INTEGRAL_PWM / ki;
+      integral = constrain(integral, -limit, limit);
+    } else {
+      integral = constrain(integral, -500.0f, 500.0f);
+    }
 
     const float shapedForDerivative = glShape(mu - 1.0f, pow(dt, 1.0f - mu));
     const float derivative = (shapedForDerivative - previousShapedError) / dt;
@@ -364,10 +386,13 @@ QGPMaker_Encoder encoder2(2);
 QGPMaker_Encoder encoder3(3);
 QGPMaker_Encoder encoder4(4);
 
+// Map 0-based motor index to the shield's 1-based motor ports.
 QGPMaker_DCMotor *getMotor(uint8_t index) {
   return motorShield.getMotor(index + 1);
 }
 
+// Read the tick delta since the previous call and clear the counter, with
+// interrupts disabled so the ISR cannot update the count mid-read.
 int32_t readEncoderAndResetAtomic(uint8_t index) {
   noInterrupts();
   int32_t value;
@@ -381,6 +406,7 @@ int32_t readEncoderAndResetAtomic(uint8_t index) {
   return value;
 }
 
+// Cut power to all motors and let them coast.
 void releaseAllMotors() {
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     QGPMaker_DCMotor *m = getMotor(i);
@@ -400,22 +426,29 @@ void brakeAllMotors() {
   }
 }
 
-// Trials only ever drive wheels forward -- direction sign isn't part of
-// what's being measured here.
-void applyMotorOutputForward(uint8_t index, float magnitudePWM) {
-  uint8_t pwm = (uint8_t)constrain((int)(magnitudePWM + 0.5f), 0, 255);
+// Signed PWM: positive drives FORWARD, negative drives BACKWARD, so STEP
+// and MATCH can run reverse trials through the same path.
+void applyMotorOutputSigned(uint8_t index, float signedPWM) {
+  uint8_t pwm = (uint8_t)constrain((int)(fabs(signedPWM) + 0.5f), 0, 255);
   QGPMaker_DCMotor *m = getMotor(index);
   if (pwm < 1) {
     m->setSpeed(0);
     m->run(RELEASE);
     return;
   }
-  m->run(FORWARD);
+  m->run((signedPWM >= 0.0f) ? FORWARD : BACKWARD);
   m->setSpeed(pwm);
 }
 
+// Returns the PWM magnitude for a signed target speed, using the fit for
+// whichever direction the sign selects.
 float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
-  const float pwm = (targetMMs - FF_INTERCEPT_MM_S[motorIndex]) / FF_SLOPE_MM_S_PER_PWM[motorIndex];
+  const bool reverse = targetMMs < 0.0f;
+  const float slope = reverse ? FF_SLOPE_MM_S_PER_PWM_REV[motorIndex]
+                              : FF_SLOPE_MM_S_PER_PWM_FWD[motorIndex];
+  const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
+                                  : FF_INTERCEPT_MM_S_FWD[motorIndex];
+  const float pwm = (fabs(targetMMs) - intercept) / slope;
   return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
 }
 
@@ -461,6 +494,7 @@ bool pollAbort() {
   return abortRequested;
 }
 
+// Common cleanup when a trial is interrupted by STOP/ESTOP.
 void finishAborted() {
   releaseAllMotors();
   Serial.println(F("ABORTED,STOPPED"));
@@ -470,8 +504,18 @@ void finishAborted() {
 // STEP: single-motor closed-loop (PID engaged) dynamic step trial
 // -----------------------------------------------------------------------------
 
+// Run one closed-loop step test on a single motor: PID + feed-forward drive
+// for durationMs, optional per-tick SAMPLE output (AUTOTUNE runs it silent),
+// then rise/overshoot/steady-error/cost metrics and a braked rest.
 StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs, bool emitSamples) {
   StepResult result = {0.0f, -1.0f, 0.0f, 0.0f, false, ++trialCounter};
+
+  // Trials run signed: dir flips the drive direction and maps measured
+  // speed back into magnitude space so rise/overshoot/steady metrics mean
+  // the same thing forward and reverse. The PID itself works in signed
+  // space, same as production.
+  const float dir = (targetMMs < 0.0f) ? -1.0f : 1.0f;
+  const float targetMag = fabs(targetMMs);
 
   readEncoderAndResetAtomic(motorIndex);
   wheelPID[motorIndex].reset();
@@ -481,7 +525,7 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
   uint32_t last = start;
   float peak = 0.0f;
   bool riseRecorded = false;
-  const float riseThreshold = targetMMs * 0.9f;
+  const float riseThreshold = targetMag * 0.9f;
 
   float steadySum = 0.0f;
   uint32_t steadyCount = 0;
@@ -499,16 +543,22 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
       last = now;
       dt = constrain(dt, 0.005f, 0.050f);
 
+      // Encoder ticks -> mm/s, low-pass filtered like the production loop.
       const int32_t rawTicks = readEncoderAndResetAtomic(motorIndex);
       const float signedTicks = rawTicks * ENCODER_SIGN[motorIndex];
       const float rawSpeed = (signedTicks * MM_PER_COUNT[motorIndex]) / dt;
       filteredSpeed += 0.35f * (rawSpeed - filteredSpeed);
 
+      // Positive when moving in the commanded direction, whichever it is.
+      const float speedMag = dir * filteredSpeed;
+
       const float error = targetMMs - filteredSpeed;
       const float feedForward = speedFeedForwardPWM(targetMMs, motorIndex);
       const float correction = wheelPID[motorIndex].update(targetMMs, filteredSpeed, dt);
-      const float out = constrain(feedForward + correction, 0.0f, 255.0f);
-      applyMotorOutputForward(motorIndex, out);
+      // Same shape as production: correction is signed, feed-forward is a
+      // magnitude, output magnitude clamps at 0 (no direction flip).
+      const float out = constrain(feedForward + dir * correction, 0.0f, 255.0f);
+      applyMotorOutputSigned(motorIndex, dir * out);
 
       const uint32_t elapsedMs = now - start;
 
@@ -526,23 +576,23 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
         Serial.print(F(",error_mm_s="));
         Serial.print(error, 2);
         Serial.print(F(",ff_pwm="));
-        Serial.print(feedForward, 1);
+        Serial.print(dir * feedForward, 1);
         Serial.print(F(",correction_pwm="));
         Serial.print(correction, 1);
         Serial.print(F(",pwm="));
-        Serial.println(out, 1);
+        Serial.println(dir * out, 1);
       }
 
       result.cost += fabs(error) * (elapsedMs * 0.001f) * dt;
 
-      if (filteredSpeed > peak) peak = filteredSpeed;
-      if (!riseRecorded && filteredSpeed >= riseThreshold) {
+      if (speedMag > peak) peak = speedMag;
+      if (!riseRecorded && speedMag >= riseThreshold) {
         result.riseTimeS = elapsedMs * 0.001f;
         riseRecorded = true;
       }
 
       if (elapsedMs >= steadyStartMs) {
-        steadySum += filteredSpeed;
+        steadySum += speedMag;
         ++steadyCount;
       }
     }
@@ -550,11 +600,14 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
 
   brakeAllMotors();
 
-  result.overshootPct = (peak > targetMMs) ? ((peak - targetMMs) / targetMMs * 100.0f) : 0.0f;
+  // Summary metrics: overshoot relative to the target magnitude, steady-state
+  // error from the averaged tail window (or last sample if aborted early),
+  // plus the weighted cost terms AUTOTUNE minimizes.
+  result.overshootPct = (peak > targetMag) ? ((peak - targetMag) / targetMag * 100.0f) : 0.0f;
   if (steadyCount > 0) {
-    result.steadyStateErrorMMs = targetMMs - (steadySum / steadyCount);
+    result.steadyStateErrorMMs = targetMag - (steadySum / steadyCount);
   } else {
-    result.steadyStateErrorMMs = targetMMs - filteredSpeed;
+    result.steadyStateErrorMMs = targetMag - dir * filteredSpeed;
   }
   if (!riseRecorded) {
     result.cost += NO_RISE_PENALTY;
@@ -562,6 +615,7 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
   result.cost += OVERSHOOT_COST_WEIGHT * result.overshootPct;
   result.cost += STEADY_ERROR_COST_WEIGHT * fabs(result.steadyStateErrorMMs);
 
+  // Braked rest so the wheel is truly stopped before the next trial.
   if (!result.aborted) {
     const uint32_t restStart = millis();
     while (millis() - restStart < REST_DURATION_MS) {
@@ -575,6 +629,7 @@ StepResult runStepTrial(uint8_t motorIndex, float targetMMs, uint16_t durationMs
   return result;
 }
 
+// Print the STEP_RESULT summary line for one finished step test.
 void printStepResult(uint8_t motorIndex, float targetMMs, const StepResult &r) {
   Serial.print(F("STEP_RESULT,trial="));
   Serial.print(r.trialId);
@@ -592,6 +647,7 @@ void printStepResult(uint8_t motorIndex, float targetMMs, const StepResult &r) {
   Serial.println(r.cost, 3);
 }
 
+// Top-level STEP command: run one verbose step trial on one motor and report.
 void runStep(uint8_t motorIndex, float targetMMs, uint16_t durationMs) {
   abortRequested = false;
   releaseAllMotors();
@@ -618,6 +674,8 @@ void runStep(uint8_t motorIndex, float targetMMs, uint16_t durationMs) {
 // silent (no per-tick SAMPLE output) STEP trial as the cost evaluator.
 // -----------------------------------------------------------------------------
 
+// Load a candidate gain set (index order kp/ki/kd/lambda/mu) into the motor's
+// PID and run one silent step trial; the trial's cost is the search objective.
 float evaluateAutotuneCost(uint8_t motorIndex, const float *params, float targetMMs, bool *aborted) {
   wheelPID[motorIndex].configure(params[0], params[1], params[2], params[3], params[4]);
   StepResult r = runStepTrial(motorIndex, targetMMs, DEFAULT_DURATION_MS, false);
@@ -625,6 +683,7 @@ float evaluateAutotuneCost(uint8_t motorIndex, const float *params, float target
   return r.cost;
 }
 
+// Print one AUTOTUNE_EVAL line describing a just-evaluated candidate.
 void printAutotuneEval(uint8_t motorIndex, uint16_t iter, const char *paramName,
                         const float *params, float cost, float bestCost) {
   Serial.print(F("AUTOTUNE_EVAL,motor="));
@@ -649,6 +708,7 @@ void printAutotuneEval(uint8_t motorIndex, uint16_t iter, const char *paramName,
   Serial.println(bestCost, 3);
 }
 
+// Print the final AUTOTUNE_RESULT line with the winning gain set.
 void printAutotuneResult(uint8_t motorIndex, const float *params, float cost) {
   Serial.print(F("AUTOTUNE_RESULT,motor="));
   Serial.print(motorIndex + 1);
@@ -666,6 +726,9 @@ void printAutotuneResult(uint8_t motorIndex, const float *params, float cost) {
   Serial.println(cost, 3);
 }
 
+// Top-level AUTOTUNE command: twiddle (coordinate descent) starting from the
+// motor's current gains. For each parameter in turn, try +dp; if that doesn't
+// beat the best cost, try -dp; grow dp on success, shrink it on failure.
 void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
   abortRequested = false;
   releaseAllMotors();
@@ -684,11 +747,13 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
   float dp[5];
   for (uint8_t i = 0; i < 5; ++i) dp[i] = AUTOTUNE_INITIAL_STEP[i];
 
+  // Baseline cost of the starting gains; every candidate must beat this.
   bool aborted = false;
   float bestCost = evaluateAutotuneCost(motorIndex, bestParams, targetMMs, &aborted);
 
   for (uint16_t iter = 0; iter < maxIterations && !aborted; ++iter) {
     for (uint8_t i = 0; i < 5 && !aborted; ++i) {
+      // Probe upward first: parameter i + dp[i], clamped to the safe bounds.
       float trialParams[5];
       memcpy(trialParams, bestParams, sizeof(trialParams));
       trialParams[i] = constrain(bestParams[i] + dp[i], AUTOTUNE_MIN[i], AUTOTUNE_MAX[i]);
@@ -698,12 +763,14 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
       if (aborted) break;
 
       if (cost < bestCost) {
+        // Improvement: keep it and widen this parameter's search step.
         bestCost = cost;
         memcpy(bestParams, trialParams, sizeof(bestParams));
         dp[i] *= 1.1f;
         continue;
       }
 
+      // Upward probe failed: try the same distance downward.
       trialParams[i] = constrain(bestParams[i] - dp[i], AUTOTUNE_MIN[i], AUTOTUNE_MAX[i]);
       cost = evaluateAutotuneCost(motorIndex, trialParams, targetMMs, &aborted);
       printAutotuneEval(motorIndex, iter, AUTOTUNE_PARAM_NAMES[i], trialParams, cost, bestCost);
@@ -714,6 +781,7 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
         memcpy(bestParams, trialParams, sizeof(bestParams));
         dp[i] *= 1.1f;
       } else {
+        // Neither direction helped: narrow this parameter's search step.
         dp[i] *= 0.9f;
       }
     }
@@ -740,10 +808,17 @@ void runAutotune(uint8_t motorIndex, float targetMMs, uint16_t maxIterations) {
 // near-identical wheel speeds.
 // -----------------------------------------------------------------------------
 
+// Drive all four motors closed-loop at the same target for durationMs,
+// streaming combined SAMPLE lines, then compute per-wheel steady-state speeds
+// and the cross-wheel mismatch metrics (left/right diff, max pair diff, spread).
 MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
   MatchResult result;
   result.aborted = false;
   result.trialId = ++trialCounter;
+
+  // Negative target runs the whole trial in reverse. Speeds and PWMs are
+  // reported signed; the mismatch metrics work the same either way.
+  const float dir = (targetMMs < 0.0f) ? -1.0f : 1.0f;
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     result.steadyMMs[i] = 0.0f;
     result.errorMMs[i] = 0.0f;
@@ -774,6 +849,8 @@ MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
       dt = constrain(dt, 0.005f, 0.050f);
       const uint32_t elapsedMs = now - start;
 
+      // Same per-wheel pipeline as STEP, applied to all four motors in one
+      // tick: measure, filter, feed-forward + PID, drive.
       float pwmOut[MOTOR_COUNT];
       for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         const int32_t rawTicks = readEncoderAndResetAtomic(i);
@@ -783,9 +860,9 @@ MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
 
         const float feedForward = speedFeedForwardPWM(targetMMs, i);
         const float correction = wheelPID[i].update(targetMMs, filteredSpeed[i], dt);
-        const float out = constrain(feedForward + correction, 0.0f, 255.0f);
-        applyMotorOutputForward(i, out);
-        pwmOut[i] = out;
+        const float out = constrain(feedForward + dir * correction, 0.0f, 255.0f);
+        applyMotorOutputSigned(i, dir * out);
+        pwmOut[i] = dir * out;
 
         if (elapsedMs >= steadyStartMs) {
           steadySum[i] += filteredSpeed[i];
@@ -813,11 +890,15 @@ MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
 
   brakeAllMotors();
 
+  // Steady-state speed per wheel from the tail-window average, and each
+  // wheel's own tracking error against the shared target.
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     result.steadyMMs[i] = (steadyCount > 0) ? (steadySum[i] / steadyCount) : filteredSpeed[i];
     result.errorMMs[i] = targetMMs - result.steadyMMs[i];
   }
 
+  // Cross-wheel mismatch metrics: side averages, signed left-right
+  // difference, and max-min spread across all four wheels.
   float leftSum = 0.0f, rightSum = 0.0f;
   uint8_t leftCount = 0, rightCount = 0;
   float maxSpeed = result.steadyMMs[0], minSpeed = result.steadyMMs[0];
@@ -832,6 +913,7 @@ MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
   result.leftRightDiffMMs = result.leftAvgMMs - result.rightAvgMMs;
   result.spreadMMs = maxSpeed - minSpeed;
 
+  // Largest speed gap between any two wheels.
   float maxPairDiff = 0.0f;
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     for (uint8_t j = i + 1; j < MOTOR_COUNT; ++j) {
@@ -854,6 +936,7 @@ MatchResult runMatchTrial(float targetMMs, uint16_t durationMs) {
   return result;
 }
 
+// Print the MATCH_RESULT summary line for one finished four-wheel trial.
 void printMatchResult(float targetMMs, const MatchResult &r) {
   Serial.print(F("MATCH_RESULT,trial="));
   Serial.print(r.trialId);
@@ -874,6 +957,7 @@ void printMatchResult(float targetMMs, const MatchResult &r) {
   Serial.print(F(",spread_mm_s=")); Serial.println(r.spreadMMs, 2);
 }
 
+// Top-level MATCH command: run one four-wheel matching trial and report.
 void runMatch(float targetMMs, uint16_t durationMs) {
   abortRequested = false;
   releaseAllMotors();
@@ -901,6 +985,9 @@ void runMatch(float targetMMs, uint16_t durationMs) {
 // (not braked) at the end so it can be hand-corrected back to the mark.
 // -----------------------------------------------------------------------------
 
+// Run one position move: P position loop -> speed setpoint -> speed PID,
+// until the wheel holds within tolerance for ROTATE_SETTLE_HOLD_MS or the
+// timeout expires. Position is tracked in rim-mm (angle * mm-per-degree).
 RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeoutMs) {
   RotateResult result = {0.0f, 0.0f, -1.0f, false, false, ++trialCounter};
 
@@ -932,6 +1019,7 @@ RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeou
       last = now;
       dt = constrain(dt, 0.005f, 0.050f);
 
+      // Integrate encoder travel into position; speed is filtered as usual.
       const int32_t rawTicks = readEncoderAndResetAtomic(motorIndex);
       const float deltaMM = (rawTicks * ENCODER_SIGN[motorIndex]) * MM_PER_COUNT[motorIndex];
       positionMM += deltaMM;
@@ -955,7 +1043,9 @@ RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeou
         correction = wheelPID[motorIndex].update(speedSetpoint, filteredSpeed, dt);
         out = constrain(feedForward + correction, 0.0f, 255.0f);
       }
-      applyMotorOutputForward(motorIndex, out);
+      // ROTATE stays forward-only (setpoint clamped >= 0 above), so the
+      // signed drive helper always gets a non-negative PWM here.
+      applyMotorOutputSigned(motorIndex, out);
 
       const uint32_t elapsedMs = now - start;
 
@@ -980,6 +1070,8 @@ RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeou
       Serial.print(F(",pwm="));
       Serial.println(out, 1);
 
+      // Settled = held inside the angle tolerance continuously for
+      // ROTATE_SETTLE_HOLD_MS; leaving tolerance restarts the clock.
       if (fabs(positionError) <= toleranceMM) {
         if (!withinTolerance) {
           withinTolerance = true;
@@ -1000,6 +1092,8 @@ RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeou
   // mark before the next trial.
   releaseAllMotors();
 
+  // Final angle and encoder-measured overshoot past the target; if it never
+  // settled, report the full elapsed time instead.
   result.finalAngleDeg = positionMM / mmPerDeg;
   const float overshootMM = peakPositionMM - targetMM;
   result.overshootDeg = (overshootMM > 0.0f) ? (overshootMM / mmPerDeg) : 0.0f;
@@ -1008,6 +1102,7 @@ RotateResult runRotateTrial(uint8_t motorIndex, float targetDeg, uint16_t timeou
   return result;
 }
 
+// Print the ROTATE_RESULT summary line for one finished position move.
 void printRotateResult(uint8_t motorIndex, float targetDeg, const RotateResult &r) {
   Serial.print(F("ROTATE_RESULT,trial="));
   Serial.print(r.trialId);
@@ -1025,6 +1120,7 @@ void printRotateResult(uint8_t motorIndex, float targetDeg, const RotateResult &
   Serial.println(r.settled ? 1 : 0);
 }
 
+// Top-level ROTATE command: run one position move on one motor and report.
 void runRotate(uint8_t motorIndex, float targetDeg, uint16_t timeoutMs) {
   abortRequested = false;
   releaseAllMotors();
@@ -1049,6 +1145,7 @@ void runRotate(uint8_t motorIndex, float targetDeg, uint16_t timeoutMs) {
 // Command parser
 // -----------------------------------------------------------------------------
 
+// Print every motor's current kp/ki/kd/lambda/mu (the GAINS command).
 void printGains() {
   for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
     Serial.print(F("GAINS,motor="));
@@ -1061,6 +1158,9 @@ void printGains() {
   }
 }
 
+// Parse and execute one complete command line (command set in the header
+// comment). Tokenizes in place with strtok_r; the command token is upper-cased
+// for case-insensitive matching.
 void processCommand(char *line) {
   char *savePtr = NULL;
   char *command = strtok_r(line, ",", &savePtr);
@@ -1118,8 +1218,10 @@ void processCommand(char *line) {
       return;
     }
 
+    // Negative target = reverse step.
     float targetMMs = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
-    targetMMs = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    const float stepMag = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    targetMMs = (targetMMs < 0.0f) ? -stepMag : stepMag;
 
     uint16_t durationMs = durationText ? (uint16_t)atoi(durationText) : DEFAULT_DURATION_MS;
     if (durationMs < MIN_DURATION_MS) durationMs = DEFAULT_DURATION_MS;
@@ -1137,8 +1239,10 @@ void processCommand(char *line) {
       return;
     }
 
+    // Negative target = evaluate candidates with reverse step trials.
     float targetMMs = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
-    targetMMs = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    const float tuneMag = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    targetMMs = (targetMMs < 0.0f) ? -tuneMag : tuneMag;
 
     uint16_t maxIterations = iterText ? (uint16_t)atoi(iterText) : DEFAULT_AUTOTUNE_ITERATIONS;
     if (maxIterations < 1) maxIterations = DEFAULT_AUTOTUNE_ITERATIONS;
@@ -1149,8 +1253,11 @@ void processCommand(char *line) {
     char *targetText = strtok_r(NULL, ",", &savePtr);
     char *durationText = strtok_r(NULL, ",", &savePtr);
 
+    // Negative target = reverse trial (checks backward straight-line
+    // matching against the reverse feed-forward curve).
     float targetMMs = targetText ? atof(targetText) : DEFAULT_TARGET_MM_S;
-    targetMMs = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    const float matchMag = constrain(fabs(targetMMs), 30.0f, MAX_WHEEL_MM_S);
+    targetMMs = (targetMMs < 0.0f) ? -matchMag : matchMag;
 
     uint16_t durationMs = durationText ? (uint16_t)atoi(durationText) : DEFAULT_DURATION_MS;
     if (durationMs < MIN_DURATION_MS) durationMs = DEFAULT_DURATION_MS;
@@ -1203,6 +1310,8 @@ void processCommand(char *line) {
   }
 }
 
+// Accumulate serial bytes into commandBuffer and dispatch a command whenever
+// a terminator (\n, \r or ':') arrives. Oversized lines are discarded.
 void readSerialCommands() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
@@ -1225,6 +1334,8 @@ void readSerialCommands() {
 // Arduino setup/loop
 // -----------------------------------------------------------------------------
 
+// One-time init: serial link, I2C, motor shield at 500 Hz PWM, motors
+// released, encoder counters cleared, production gains loaded. No IMU here.
 void setup() {
   Serial.begin(SERIAL_BAUD);
   Wire.begin();
@@ -1249,6 +1360,8 @@ void setup() {
   Serial.println(F("INFO,LIFT_ALL_WHEELS_OFF_THE_GROUND_BEFORE_RUNNING_TRIALS"));
 }
 
+// Idle loop: everything happens inside the blocking trial runners, which
+// poll for STOP/ESTOP themselves via pollAbort().
 void loop() {
   readSerialCommands();
 }

@@ -26,6 +26,9 @@ except ImportError as exc:  # pragma: no cover - runtime dependency check
 
 @dataclass
 class Telemetry:
+    """One decoded 'T,...' telemetry line from the Arduino: pose/velocity in
+    Arduino units (mm, degrees), per-wheel encoder/speed/PWM arrays, and the
+    e-stop / watchdog status flags."""
     arduino_ms: int
     x_mm: float
     y_mm: float
@@ -40,6 +43,8 @@ class Telemetry:
 
 
 def yaw_to_quaternion(yaw_rad: float) -> Quaternion:
+    # Planar robot: only rotation about Z, so the quaternion is
+    # (0, 0, sin(yaw/2), cos(yaw/2)).
     q = Quaternion()
     q.x = 0.0
     q.y = 0.0
@@ -49,9 +54,21 @@ def yaw_to_quaternion(yaw_rad: float) -> Quaternion:
 
 
 class SerialBridge(Node):
+    """Bridges the ROS 2 graph and the Arduino base controller over USB serial.
+
+    Downstream (ROS -> Arduino): rate-limited 'VEL,<mm/s>,<deg/s>' commands from
+    the muxed /cmd_vel_out topic, plus Trigger services mapped to one-shot
+    commands (ESTOP, RESET_ODOM, ...).
+    Upstream (Arduino -> ROS): 'T,...' telemetry lines republished as Odometry
+    (+ optional odom->base TF), Imu, JointState, and periodic diagnostics.
+    """
+
     def __init__(self) -> None:
         super().__init__('mdetect_serial_bridge')
 
+        # Connection, topic naming, frame, and kinematic parameters. The
+        # velocity limits clamp incoming commands before they reach the
+        # Arduino; wheel geometry converts encoder ticks to joint states.
         self.declare_parameter('port', '/dev/ttyACM0')
         self.declare_parameter('baud', 500000)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel_out')
@@ -94,12 +111,19 @@ class SerialBridge(Node):
 
         self.create_subscription(Twist, cmd_topic, self.cmd_vel_callback, 20)
 
+        # One-shot base operations exposed as std_srvs/Trigger services; each
+        # simply forwards a text command to the Arduino.
         self.create_service(Trigger, '/base/emergency_stop', self.handle_estop)
         self.create_service(Trigger, '/base/clear_emergency_stop', self.handle_clear_estop)
         self.create_service(Trigger, '/base/reset_odometry', self.handle_reset_odom)
         self.create_service(Trigger, '/base/zero_yaw', self.handle_zero_yaw)
         self.create_service(Trigger, '/base/calibrate_imu', self.handle_calibrate_imu)
 
+        # Serial link state. 'rx_buffer' accumulates bytes until a full
+        # newline-terminated line arrives. 'estop_requested' is the local latch
+        # set by the service call; 'estop_latched_reported' mirrors what the
+        # Arduino says in telemetry. 'watchdog_reported' starts True so
+        # diagnostics warn until real telemetry proves otherwise.
         self.serial_port: Optional[serial.Serial] = None
         self.serial_lock = threading.Lock()
         self.rx_buffer = bytearray()
@@ -111,6 +135,8 @@ class SerialBridge(Node):
         self.estop_requested = False
         self.watchdog_reported = True
 
+        # Three periodic jobs: stream velocity commands at command_rate_hz,
+        # poll the serial port at 200 Hz, and publish diagnostics at 1 Hz.
         command_rate = max(1.0, float(self.get_parameter('command_rate_hz').value))
         self.create_timer(1.0 / command_rate, self.command_timer)
         self.create_timer(0.005, self.serial_read_timer)
@@ -122,6 +148,9 @@ class SerialBridge(Node):
         )
 
     def connect_serial(self) -> bool:
+        # Open the Arduino port if it is not already open. Reconnect attempts
+        # are throttled to one every reconnect_period_s so a missing device
+        # does not spam errors.
         if self.serial_port is not None and self.serial_port.is_open:
             return True
 
@@ -137,6 +166,8 @@ class SerialBridge(Node):
                 timeout=0.0,
                 write_timeout=0.1,
             )
+            # Give the board a moment after the port opens (opening the port
+            # can reset the Arduino), discard stale bytes, then probe it.
             time.sleep(0.2)
             self.serial_port.reset_input_buffer()
             self.rx_buffer.clear()
@@ -149,6 +180,8 @@ class SerialBridge(Node):
             return False
 
     def disconnect_serial(self, reason: str) -> None:
+        # Close and forget the port after an I/O failure; connect_serial()
+        # will retry on the next timer tick.
         if self.serial_port is not None:
             try:
                 self.serial_port.close()
@@ -158,6 +191,8 @@ class SerialBridge(Node):
         self.get_logger().error(f'Arduino serial disconnected: {reason}')
 
     def send_line(self, command: str) -> bool:
+        # Send one newline-terminated ASCII command to the Arduino. The lock
+        # serializes writes between the command timer and service callbacks.
         if not self.connect_serial():
             return False
         assert self.serial_port is not None
@@ -172,17 +207,25 @@ class SerialBridge(Node):
             return False
 
     def cmd_vel_callback(self, msg: Twist) -> None:
+        # Cache the latest command, clamped to the configured limits; the
+        # command timer streams it to the Arduino at a fixed rate.
         self.last_cmd.linear.x = max(-self.max_linear, min(self.max_linear, msg.linear.x))
         self.last_cmd.angular.z = max(-self.max_angular, min(self.max_angular, msg.angular.z))
 
     def command_timer(self) -> None:
+        # Continuously resend the last command (the Arduino has a watchdog that
+        # stops the motors if VEL lines stop arriving). Suppressed entirely
+        # while an e-stop is requested or reported.
         if self.estop_requested or self.estop_latched_reported:
             return
+        # Convert ROS units (m/s, rad/s) to Arduino units (mm/s, deg/s).
         linear_mm_s = self.last_cmd.linear.x * 1000.0
         angular_deg_s = math.degrees(self.last_cmd.angular.z)
         self.send_line(f'VEL,{linear_mm_s:.2f},{angular_deg_s:.2f}')
 
     def serial_read_timer(self) -> None:
+        # Drain available bytes and dispatch each complete line. Non-blocking:
+        # reads only what is already waiting.
         if not self.connect_serial():
             return
         assert self.serial_port is not None
@@ -206,6 +249,8 @@ class SerialBridge(Node):
             self.disconnect_serial(str(exc))
 
     def handle_serial_line(self, line: str) -> None:
+        # Route one line from the Arduino: 'T,...' is telemetry (parsed and
+        # republished); ERR/INFO/READY are logged; ACK/PONG are debug noise.
         self.last_rx_text = line
         if line.startswith('T,'):
             telemetry = self.parse_telemetry(line)
@@ -222,6 +267,8 @@ class SerialBridge(Node):
             self.get_logger().debug(f'Arduino: {line}')
 
     def parse_telemetry(self, line: str) -> Optional[Telemetry]:
+        # Decode a comma-separated telemetry line into a Telemetry record;
+        # returns None (with a warning) on any malformed field.
         fields = line.split(',')
         # T + 6 base fields + 4 ticks + 4 wheel speeds + 4 PWM + 2 flags = 21
         if len(fields) != 21:
@@ -246,10 +293,15 @@ class SerialBridge(Node):
             return None
 
     def publish_telemetry(self, data: Telemetry) -> None:
+        # Fan one telemetry sample out to all ROS consumers: Odometry,
+        # optional odom->base TF, Imu, and JointState — all with one stamp.
         stamp = self.get_clock().now().to_msg()
         yaw_rad = math.radians(data.yaw_deg)
         q = yaw_to_quaternion(yaw_rad)
 
+        # Odometry: convert Arduino mm/deg units to m/rad. Covariance is
+        # meaningful only for the planar dimensions (x, y, yaw); the rest are
+        # set huge so downstream fusion ignores them.
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self.odom_frame
@@ -278,6 +330,8 @@ class SerialBridge(Node):
         ]
         self.odom_pub.publish(odom)
 
+        # Broadcast odom->base_footprint unless something else (e.g. an EKF)
+        # owns that transform.
         if self.publish_odom_tf:
             transform = TransformStamped()
             transform.header.stamp = stamp
@@ -289,6 +343,9 @@ class SerialBridge(Node):
             transform.transform.rotation = q
             self.tf_broadcaster.sendTransform(transform)
 
+        # IMU message carries only yaw orientation and Z angular rate; the
+        # -1 in linear_acceleration_covariance[0] marks acceleration as
+        # unavailable per the sensor_msgs/Imu convention.
         imu = Imu()
         imu.header.stamp = stamp
         imu.header.frame_id = self.imu_frame
@@ -299,6 +356,8 @@ class SerialBridge(Node):
         imu.linear_acceleration_covariance[0] = -1.0
         self.imu_pub.publish(imu)
 
+        # Joint states for the four wheels: encoder ticks -> wheel angle (rad),
+        # rim speed (mm/s) -> angular velocity (rad/s).
         joint = JointState()
         joint.header.stamp = stamp
         joint.name = [
@@ -316,6 +375,8 @@ class SerialBridge(Node):
         self.joint_pub.publish(joint)
 
     def diagnostics_timer(self) -> None:
+        # Publish a 1 Hz health summary. Severity, worst first: port closed >
+        # stale telemetry > e-stop latched > watchdog tripped > OK.
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
         status = DiagnosticStatus()
@@ -353,16 +414,22 @@ class SerialBridge(Node):
         self.diag_pub.publish(msg)
 
     def trigger_command(self, response: Trigger.Response, command: str, message: str) -> Trigger.Response:
+        # Shared helper for all Trigger services: send the command and report
+        # success/failure back to the caller.
         response.success = self.send_line(command)
         response.message = message if response.success else 'Arduino serial port is not connected'
         return response
 
     def handle_estop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        # Zero the cached command and latch the local e-stop flag (which also
+        # stops the VEL stream) before telling the Arduino to stop.
         self.last_cmd = Twist()
         self.estop_requested = True
         return self.trigger_command(response, 'ESTOP', 'Emergency stop command sent and latched')
 
     def handle_clear_estop(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        # Only release the local latches if the clear command actually reached
+        # the Arduino.
         self.last_cmd = Twist()
         result = self.trigger_command(response, 'CLEAR_ESTOP', 'Emergency stop clear command sent')
         if result.success:
@@ -387,6 +454,8 @@ class SerialBridge(Node):
         )
 
     def destroy_node(self) -> bool:
+        # Best effort on shutdown: command the motors to stop, then close the
+        # port. Errors are ignored because the node is going away regardless.
         try:
             self.send_line('STOP')
         except Exception:

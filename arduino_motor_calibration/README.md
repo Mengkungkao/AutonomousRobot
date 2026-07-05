@@ -29,23 +29,31 @@ will crawl into whatever is in front of it.
 
 ## Commands
 
-### `CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>]]`
+### `CALIBRATE,<motor 1-4>[,<pwm_step>[,<hold_ms>[,R]]]`
 
 Open-loop (no PID) PWM sweep from `MIN_EFFECTIVE_PWM` to `MAX_DRIVE_PWM` on
 one motor, step size `pwm_step`, holding each step for `hold_ms` and
 measuring steady-state speed from the encoder. Reports each step's speed
 against what that motor's own calibrated feed-forward curve
-(`FF_SLOPE_MM_S_PER_PWM`/`FF_INTERCEPT_MM_S`, used by `speedFeedForwardPWM`)
-predicts for that PWM, so any remaining gap -- e.g. from the real response
-saturating at high PWM, which a straight-line fit doesn't capture -- is
-visible directly.
+(`FF_SLOPE_MM_S_PER_PWM_FWD/REV` + `FF_INTERCEPT_MM_S_FWD/REV`, used by
+`speedFeedForwardPWM`) predicts for that PWM, so any remaining gap -- e.g.
+from the real response saturating at high PWM, which a straight-line fit
+doesn't capture -- is visible directly.
 
-Defaults: `pwm_step=10`, `hold_ms=1000`. Only the chosen motor moves.
+A trailing `R` sweeps in **reverse** (`measured_mm_s`/`expected_mm_s` print
+negative). Brushed gearmotors are direction-asymmetric -- the same PWM does
+not produce the same speed backward as forward, and each motor is
+differently asymmetric -- so the reverse curve needs its own sweep and fit.
+This is exactly what makes a robot that drives straight forward drift in
+reverse.
+
+Defaults: `pwm_step=10`, `hold_ms=1000`, forward. Only the chosen motor
+moves.
 
 Output per step:
 
 ```text
-CAL,motor=<n>,pwm=...,measured_mm_s=...,expected_mm_s=...,error_mm_s=...,error_pct=...
+CAL,motor=<n>,dir=<F|R>,pwm=...,measured_mm_s=...,expected_mm_s=...,error_mm_s=...,error_pct=...
 ```
 
 Ends with `INFO,CALIBRATE_DONE,motor=<n>`.
@@ -53,8 +61,11 @@ Ends with `INFO,CALIBRATE_DONE,motor=<n>`.
 ### `OPENLOOP,<motor 1-4>[,<target_mm_s>]`
 
 Runs one dynamic step test at `target_mm_s`, feed-forward PWM only
-(correction forced to 0 -- no PID involved at all). Defaults:
-`target_mm_s=220`. Only the chosen motor moves.
+(correction forced to 0 -- no PID involved at all). A negative
+`target_mm_s` runs the step in reverse: `SAMPLE` speeds print signed, but
+the `OPENLOOP_RESULT` metrics stay in magnitude terms so forward and
+reverse runs compare directly. Defaults: `target_mm_s=220`. Only the
+chosen motor moves.
 
 Output, one line per 10ms control tick (raw step response, for offline
 analysis/plotting):
@@ -89,22 +100,26 @@ Replies `PONG`.
 ## Calibration procedure
 
 1. **Lift all four wheels off the ground.**
-2. Run `CALIBRATE,<motor>,10,1000` for each of the 4 motors, one at a time.
-3. Fit each motor's own linear model from the `measured_mm_s`/`pwm` pairs:
-   `measured_mm_s = slope*pwm + intercept`. Update
-   `FF_SLOPE_MM_S_PER_PWM`/`FF_INTERCEPT_MM_S` in **both**
-   `arduino_motor_calibration.ino` and `arduino_ros2_base_controller.ino`
-   (they must be kept in sync manually -- there's no shared header between
-   the two independent sketches).
-4. Re-run `CALIBRATE` on all 4 motors again. `expected_mm_s` now reflects the
-   new fit, so `error_mm_s`/`error_pct` show you the residual directly --
-   confirm it's small and stable before moving on. If a second independent
-   run shows the same residual pattern and magnitude, that's real motor
-   nonlinearity (not measurement noise) and refitting further won't help
-   much.
-5. Run `OPENLOOP,<motor>,220` (or whatever your typical operating speed is)
-   on each of the 4 motors. This is your open-loop dynamic baseline --
-   record `rise_s`, `overshoot_pct`, `steady_err_mm_s` per motor.
+2. Run `CALIBRATE,<motor>,10,1000` for each of the 4 motors, one at a time,
+   then `CALIBRATE,<motor>,10,1000,R` for each motor's reverse sweep.
+3. Fit each motor's own linear model per direction from the
+   `measured_mm_s`/`pwm` pairs: `|measured_mm_s| = slope*pwm + intercept`
+   (use the magnitude of the reverse speeds). Update
+   `FF_SLOPE_MM_S_PER_PWM_FWD/REV` + `FF_INTERCEPT_MM_S_FWD/REV` in **all
+   three** sketches: `arduino_motor_calibration.ino`,
+   `arduino_fopid_tuning.ino` and `arduino_ros2_base_controller.ino` (they
+   must be kept in sync manually -- there's no shared header between the
+   independent sketches).
+4. Re-run `CALIBRATE` (both directions) on all 4 motors again.
+   `expected_mm_s` now reflects the new fit, so `error_mm_s`/`error_pct`
+   show you the residual directly -- confirm it's small and stable before
+   moving on. If a second independent run shows the same residual pattern
+   and magnitude, that's real motor nonlinearity (not measurement noise)
+   and refitting further won't help much.
+5. Run `OPENLOOP,<motor>,220` and `OPENLOOP,<motor>,-220` (or whatever your
+   typical operating speed is) on each of the 4 motors. This is your
+   open-loop dynamic baseline per direction -- record `rise_s`,
+   `overshoot_pct`, `steady_err_mm_s` per motor.
 6. Move to `arduino_ros2_base_controller.ino` and hand-tune PID per motor
    (see below), using step 5's numbers as the "before PID" reference to
    compare closed-loop behaviour against.
@@ -135,6 +150,25 @@ residual is real response nonlinearity (a soft start at low PWM, mild
 saturation at high PWM) that a straight-line model can't capture. Refitting
 from a second independent run barely moved these numbers, confirming it's
 real motor behaviour, not run-to-run noise.
+
+### Reverse feed-forward coefficients (2026-07-05)
+
+`CALIBRATE,<motor>,10,1000,R` sweeps (PWM 50-210; stalled deadband points
+below ~15 mm/s excluded from the fit -- motor 1 doesn't start moving in
+reverse until PWM ~70):
+
+| Motor | Slope (mm/s per PWM) | Intercept | Residual RMSE |
+|---|---|---|---|
+| 1 | 2.4662 | -118.32 | 17.3 mm/s |
+| 2 | 2.1564 | -86.97 | 11.3 mm/s |
+| 3 | 1.9853 | -92.43 | 5.4 mm/s |
+| 4 | 2.5093 | -104.95 | 14.1 mm/s |
+
+Every motor is slower in reverse than forward at the same PWM, and each by
+a different amount -- at 220 mm/s the required PWMs are 137/142/157/130
+in reverse vs 119/138/148/91 forward. Motor 4 is the standout (+38 PWM vs
+its forward curve), which is why the robot drove straight forward but
+drifted hard when backing up before the reverse fit existed.
 
 ### OPENLOOP baseline at 220 mm/s (feed-forward only, zero PID)
 

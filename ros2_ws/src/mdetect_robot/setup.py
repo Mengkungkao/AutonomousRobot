@@ -8,6 +8,8 @@ setup(
     name=package_name,
     version='1.0.0',
     packages=find_packages(exclude=['test']),
+    # Install launch files, YAML configs, and URDF into the package's share
+    # directory so launch files and get_package_share_directory() can find them.
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -21,6 +23,7 @@ setup(
     maintainer_email='meng@example.com',
     description='mDetect ROS2 mobile robot stack',
     license='MIT',
+    # Executables exposed to `ros2 run mdetect_robot <name>`.
     entry_points={
         'console_scripts': [
             'serial_bridge = mdetect_robot.serial_bridge:main',

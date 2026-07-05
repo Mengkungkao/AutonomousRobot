@@ -1,3 +1,6 @@
+# Keyboard teleoperation node (adapted from the standard ROS
+# teleop_twist_keyboard): reads single keypresses from the terminal and
+# publishes Twist (or TwistStamped) velocity commands on 'cmd_vel'.
 import sys
 import threading
 
@@ -5,6 +8,8 @@ import geometry_msgs.msg
 import rcl_interfaces.msg
 import rclpy
 
+# Raw single-key input needs platform-specific terminal handling:
+# msvcrt on Windows, termios/tty raw mode on POSIX.
 if sys.platform == 'win32':
     import msvcrt
 else:
@@ -35,6 +40,8 @@ anything else : stop
 CTRL-C to quit
 """
 
+# Key -> (x, y, z, yaw) direction multipliers. This differential-drive robot
+# only uses x (forward/backward) and yaw (rotate left/right).
 moveBindings = {
     'w': (1, 0, 0, 0),
     's': (-1, 0, 0, 0),
@@ -42,6 +49,8 @@ moveBindings = {
     'd': (0, 0, 0, -1),
 }
 
+# Key -> (linear factor, angular factor) applied multiplicatively to the
+# current speed settings.
 speedBindings = {
     ',': (1.1, 1.1),
     '.': (.9, .9),
@@ -53,6 +62,8 @@ speedBindings = {
 
 
 def getKey(settings):
+    # Block until one key is pressed and return it without requiring Enter.
+    # On POSIX the terminal is put in raw mode just for the read, then restored.
     if sys.platform == 'win32':
         # getwch() returns a string on Windows
         key = msvcrt.getwch()
@@ -64,6 +75,8 @@ def getKey(settings):
     return key
 
 
+# Snapshot the terminal attributes so they can be restored on exit
+# (raw mode would otherwise leave the shell in a broken state).
 def saveTerminalSettings():
     if sys.platform == 'win32':
         return None
@@ -76,6 +89,7 @@ def restoreTerminalSettings(old_settings):
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
+# Format the current speed settings for display.
 def vels(speed, turn):
     return 'currently:\tspeed %.2f\tturn %.2f ' % (speed, turn)
 
@@ -87,7 +101,9 @@ def main():
 
     node = rclpy.create_node('teleop_keyboard')
 
-    # parameters
+    # Parameters: 'stamped' selects TwistStamped output, 'frame_id' fills the
+    # header when stamped, 'speed'/'turn' are the initial linear (m/s) and
+    # angular (rad/s) magnitudes.
     read_only_descriptor = rcl_interfaces.msg.ParameterDescriptor(read_only=True)
     stamped = node.declare_parameter('stamped', False, read_only_descriptor).value
     frame_id = node.declare_parameter('frame_id', '', read_only_descriptor).value
@@ -104,14 +120,20 @@ def main():
 
     pub = node.create_publisher(TwistMsg, 'cmd_vel', 10)
 
+    # Spin in a background thread so the main thread can block on keyboard
+    # input while ROS callbacks (e.g. parameter services) stay responsive.
     spinner = threading.Thread(target=rclpy.spin, args=(node,))
     spinner.start()
 
+    # Current direction multipliers (set by keypresses) and a counter used to
+    # re-print the help text every 15 speed changes.
     x = 0.0
     z = 0.0
     th = 0.0
     status = 0.0
 
+    # 'twist' aliases the Twist portion of the outgoing message so the loop
+    # below works identically for stamped and unstamped variants.
     twist_msg = TwistMsg()
 
     if stamped:
@@ -124,12 +146,15 @@ def main():
     try:
         print(msg)
         print(vels(speed, turn))
+        # Main loop: one keypress -> one published command.
         while True:
             key = getKey(settings)
             if key in moveBindings.keys():
+                # Movement key: set direction multipliers.
                 x = moveBindings[key][0]
                 th = moveBindings[key][3]
             elif key in speedBindings.keys():
+                # Speed key: scale the current magnitudes and show them.
                 speed = speed * speedBindings[key][0]
                 turn = turn * speedBindings[key][1]
 
@@ -138,6 +163,7 @@ def main():
                     print(msg)
                 status = (status + 1) % 15
             else:
+                # Any other key stops the robot; Ctrl-C (\x03) exits.
                 x = 0.0
                 th = 0.0
                 if (key == '\x03'):
@@ -158,6 +184,8 @@ def main():
         print(e)
 
     finally:
+        # Always publish a final zero Twist so the robot stops, then restore
+        # the terminal and shut ROS down.
         if stamped:
             twist_msg.header.stamp = node.get_clock().now().to_msg()
 

@@ -1,3 +1,6 @@
+# Desktop-side mapping session: slam_toolbox (online async), the Nav2
+# navigation stack, and RViz, all configured from this package's YAML files.
+# Run alongside robot.launch.py on the robot to build a map while driving.
 import os
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription

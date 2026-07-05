@@ -17,6 +17,9 @@
 // which is exactly why it kept getting deleted by mistake; renamed to
 // avoid that.)
 
+// Result of one OPENLOOP step test: descriptive step-response metrics for a
+// single motor driven by feed-forward only (rise to 90% of target, peak
+// overshoot, steady-state error over the tail window, and a weighted cost).
 struct TrialResult {
   float cost;
   float riseTimeS;
