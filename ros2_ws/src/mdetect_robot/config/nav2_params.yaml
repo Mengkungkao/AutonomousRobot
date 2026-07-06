@@ -132,7 +132,10 @@ controller_server:
       min_lookahead_dist: 0.20
       max_lookahead_dist: 0.60
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 0.75
+      # 0.6 rad/s: fast enough that wheel targets (~51 mm/s) stay above the
+      # motors' breakaway zone, slow enough to limit LiDAR scan smear during
+      # in-place rotation (~3.4 deg per 10 Hz sweep) for slam_toolbox.
+      rotate_to_heading_angular_vel: 0.6
       transform_tolerance: 0.15
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.05

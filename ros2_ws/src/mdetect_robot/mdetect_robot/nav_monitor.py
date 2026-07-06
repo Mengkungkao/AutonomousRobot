@@ -22,8 +22,10 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import JointState, LaserScan
 from tf2_ros import Buffer, TransformListener
+
+WHEEL_RADIUS_M = 0.04025
 
 STATUS_NAMES = {
     GoalStatus.STATUS_UNKNOWN: 'unknown', GoalStatus.STATUS_ACCEPTED: 'accepted',
@@ -72,6 +74,8 @@ class NavMonitor(Node):
         self.create_subscription(Odometry, '/odom', self.odom.hit, 20)
         self.create_subscription(Twist, '/cmd_vel', self.nav_cmd.hit, 20)
         self.create_subscription(Twist, '/cmd_vel_out', self.mux_out.hit, 20)
+        self.joints = TopicProbe()
+        self.create_subscription(JointState, '/joint_states', self.joints.hit, 20)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.amcl.hit, 10)
         self.create_subscription(DiagnosticArray, '/diagnostics', self.on_diagnostics, 10)
 
@@ -158,6 +162,16 @@ class NavMonitor(Node):
                 problems.append('Nav2 is commanding motion but mux outputs zero -> mux front-stop gate or a higher-priority stale source (see mux log)')
         if self.base_status is not None and self.base_status.level != DiagnosticStatus.OK:
             problems.append(f'base controller: {self.base_status.message}')
+        # --- stall/hum check: commanded but wheels not turning --------------
+        if (cmd_stall := self.mux_out.last_msg) is not None and self.joints.last_msg is not None \
+                and self.mux_out.age() < 0.5 and self.joints.age() < 0.5:
+            wheels_mm = [v * WHEEL_RADIUS_M * 1000.0 for v in self.joints.last_msg.velocity]
+            commanded = abs(cmd_stall.linear.x) > 0.02 or abs(cmd_stall.angular.z) > 0.1
+            if commanded and wheels_mm and max(abs(v) for v in wheels_mm) < 15.0:
+                w = ' '.join(f'{v:+.0f}' for v in wheels_mm)
+                problems.append(
+                    f'WHEELS STALLED: commanded lin={cmd_stall.linear.x:+.2f} ang={cmd_stall.angular.z:+.2f} '
+                    f'but wheels [{w}] mm/s — PWM below breakaway (humming); check battery voltage / floor load')
         # --- direction check: commanded vs measured motion ------------------
         # If the base consistently moves opposite to the command, the reversal
         # is in the command chain (bridge/firmware). If commands and odometry
