@@ -242,7 +242,10 @@ float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
                                   : FF_INTERCEPT_MM_S_FWD[motorIndex];
   const float pwm = (fabs(targetMMs) - intercept) / slope;
-  return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
+  // No shared lower floor (matches arduino_ros2_base_controller): each
+  // motor's fit encodes its own dead zone, and flooring everyone at
+  // MIN_EFFECTIVE_PWM=50 forced motor 4 to ~123 mm/s minimum forward.
+  return constrain(pwm, 0.0f, (float)MAX_DRIVE_PWM);
 }
 
 // -----------------------------------------------------------------------------

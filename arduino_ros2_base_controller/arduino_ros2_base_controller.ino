@@ -341,7 +341,13 @@ float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
                                   : FF_INTERCEPT_MM_S_FWD[motorIndex];
   const float pwm = (magnitude - intercept) / slope;
-  return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
+  // No shared lower floor here: each motor's fit already encodes its own
+  // dead zone (below -intercept/slope the fit says zero speed). Flooring
+  // everyone at MIN_EFFECTIVE_PWM=50 forced motor 4 (fwd intercept +6.14,
+  // turning from near PWM 0) to ~123 mm/s minimum -- about twice a typical
+  // rotate/approach wheel target -- which made it visibly outrun the other
+  // three at low speeds. PID adds PWM if a motor still sticks below its fit.
+  return constrain(pwm, 0.0f, (float)MAX_DRIVE_PWM);
 }
 
 // Stop with motors freewheeling (coast) and clear all controller state.
@@ -714,10 +720,15 @@ void setup() {
   // }
   // lambda/mu left at 1.0 (classic PID) until AUTOTUNE/MATCH is re-run with
   // fractional-order search and pastes real per-motor values here.
-  wheelPID[0].configure(0.3420f, 0.0084f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[1].configure(0.2900f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[2].configure(0.3400f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[3].configure(0.3000f, 0.0033f, 0.0035f, 1.0f, 1.0f);
+  // ki raised 0.003-0.008 -> 0.02 (2026-07-06): with the integral output
+  // clamp fixed, the old tiny ki gave ~0.2 PWM/s of trim -- far too slow to
+  // push a humming wheel through static friction or pull an overspeeding
+  // one back. 0.02 is still well inside the 0.05 autotune bound; verify
+  // with the tuning sketch's STEP/MATCH and re-trim kp if wheels oscillate.
+  wheelPID[0].configure(0.3420f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[1].configure(0.2900f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[2].configure(0.3400f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[3].configure(0.3000f, 0.0200f, 0.0035f, 1.0f, 1.0f);
 
   mpu6050.begin();
   Serial.println(F("INFO,KEEP_ROBOT_STILL_IMU_STARTUP_CALIBRATION"));

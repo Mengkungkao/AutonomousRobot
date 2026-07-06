@@ -449,7 +449,10 @@ float speedFeedForwardPWM(float targetMMs, uint8_t motorIndex) {
   const float intercept = reverse ? FF_INTERCEPT_MM_S_REV[motorIndex]
                                   : FF_INTERCEPT_MM_S_FWD[motorIndex];
   const float pwm = (fabs(targetMMs) - intercept) / slope;
-  return constrain(pwm, MIN_EFFECTIVE_PWM, MAX_DRIVE_PWM);
+  // No shared lower floor (matches arduino_ros2_base_controller): each
+  // motor's fit encodes its own dead zone, and flooring everyone at
+  // MIN_EFFECTIVE_PWM=50 forced motor 4 to ~123 mm/s minimum forward.
+  return constrain(pwm, 0.0f, (float)MAX_DRIVE_PWM);
 }
 
 // -----------------------------------------------------------------------------
@@ -1351,10 +1354,12 @@ void setup() {
   // gains (lambda/mu = 1.0, i.e. classic PID -- see that sketch's setup()).
   // Re-sync these if production's gains change independently, and paste
   // your final tuned values back there when done.
-  wheelPID[0].configure(0.3420f, 0.0084f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[1].configure(0.2900f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[2].configure(0.3400f, 0.0034f, 0.0030f, 1.0f, 1.0f);
-  wheelPID[3].configure(0.3000f, 0.0033f, 0.0035f, 1.0f, 1.0f);
+  // ki raised to 0.02 (2026-07-06), kept identical to production
+  // arduino_ros2_base_controller setup() -- see the comment there.
+  wheelPID[0].configure(0.3420f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[1].configure(0.2900f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[2].configure(0.3400f, 0.0200f, 0.0030f, 1.0f, 1.0f);
+  wheelPID[3].configure(0.3000f, 0.0200f, 0.0035f, 1.0f, 1.0f);
 
   printReady();
   Serial.println(F("INFO,LIFT_ALL_WHEELS_OFF_THE_GROUND_BEFORE_RUNNING_TRIALS"));

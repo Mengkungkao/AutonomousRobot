@@ -114,7 +114,19 @@ controller_server:
       yaw_goal_tolerance: 0.10
 
     FollowPath:
-      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      # Rotation shim: rotate in place until the heading error to the path
+      # drops below angular_dist_threshold, publish a stop, then hand off to
+      # the primary controller. Gives "rotate -> drive straight -> rotate"
+      # motion, which the base tracks much better than blended arcs (the
+      # wheel FF calibration covers straight drive and in-place rotation).
+      plugin: nav2_rotation_shim_controller::RotationShimController
+      primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      angular_dist_threshold: 0.35
+      forward_sampling_distance: 0.3
+      simulate_ahead_time: 1.0
+      # Primary controller (RPP) parameters, read from this same namespace
+      # (rotate_to_heading_angular_vel / max_angular_accel below are shared
+      # by the shim and RPP):
       desired_linear_vel: 0.18
       lookahead_dist: 0.35
       min_lookahead_dist: 0.20
@@ -133,7 +145,9 @@ controller_server:
       regulated_linear_scaling_min_speed: 0.05
       allow_reversing: false
       use_rotate_to_heading: true
-      rotate_to_heading_min_angle: 0.785
+      # Low threshold: any heading error above ~20 deg becomes an in-place
+      # rotation instead of a driving arc, keeping motion rotate-then-straight.
+      rotate_to_heading_min_angle: 0.35
       max_angular_accel: 1.8
 
 local_costmap:
