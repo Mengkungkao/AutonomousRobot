@@ -75,7 +75,10 @@ sudo apt-get install -y curl ca-certificates
 
 if [ ! -f /etc/apt/sources.list.d/ros2.sources ]; then
   ROS_CODENAME="$(. /etc/os-release && echo "$UBUNTU_CODENAME")"
-  ROS_APT_SOURCE_VERSION="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+  # Buffer the API response before grepping: grep -m1 closing the pipe early
+  # makes curl exit 23 under pipefail.
+  ROS_APT_RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest)"
+  ROS_APT_SOURCE_VERSION="$(printf '%s\n' "$ROS_APT_RELEASE_JSON" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
   if [ -z "$ROS_APT_SOURCE_VERSION" ]; then
     echo "Could not determine the current ros2-apt-source release from GitHub" >&2
     exit 1

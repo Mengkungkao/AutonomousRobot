@@ -32,6 +32,7 @@ setup(
             'waypoint_cli = mdetect_robot.waypoint_cli:main',
             'goto_cli = mdetect_robot.goto_cli:main',
             'teleop_keyboard = mdetect_robot.teleop_keyboard:main',
+            'nav_monitor = mdetect_robot.nav_monitor:main',
         ],
     },
 )

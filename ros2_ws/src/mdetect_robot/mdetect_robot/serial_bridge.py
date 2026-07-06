@@ -134,6 +134,7 @@ class SerialBridge(Node):
         self.estop_latched_reported = False
         self.estop_requested = False
         self.watchdog_reported = True
+        self.last_wheel_speed_mm_s = [0.0, 0.0, 0.0, 0.0]
 
         # Three periodic jobs: stream velocity commands at command_rate_hz,
         # poll the serial port at 200 Hz, and publish diagnostics at 1 Hz.
@@ -211,17 +212,28 @@ class SerialBridge(Node):
         # command timer streams it to the Arduino at a fixed rate.
         self.last_cmd.linear.x = max(-self.max_linear, min(self.max_linear, msg.linear.x))
         self.last_cmd.angular.z = max(-self.max_angular, min(self.max_angular, msg.angular.z))
+        if (msg.linear.x or msg.angular.z) and (self.serial_port is None or not self.serial_port.is_open):
+            self.get_logger().warning('cmd_vel received but Arduino serial is NOT connected — command goes nowhere', throttle_duration_sec=2.0)
 
     def command_timer(self) -> None:
         # Continuously resend the last command (the Arduino has a watchdog that
         # stops the motors if VEL lines stop arriving). Suppressed entirely
         # while an e-stop is requested or reported.
         if self.estop_requested or self.estop_latched_reported:
+            if self.last_cmd.linear.x or self.last_cmd.angular.z:
+                self.get_logger().warning('velocity command suppressed: e-stop is latched', throttle_duration_sec=2.0)
             return
         # Convert ROS units (m/s, rad/s) to Arduino units (mm/s, deg/s).
         linear_mm_s = self.last_cmd.linear.x * 1000.0
         angular_deg_s = math.degrees(self.last_cmd.angular.z)
         self.send_line(f'VEL,{linear_mm_s:.2f},{angular_deg_s:.2f}')
+        # Driving heartbeat: commanded vs measured, so a command that reaches
+        # the Arduino but moves no wheels (e-stop, stall, tuning) is visible.
+        if abs(linear_mm_s) > 5.0 or abs(angular_deg_s) > 2.0:
+            wheels = ' '.join(f'{v:+.0f}' for v in self.last_wheel_speed_mm_s)
+            self.get_logger().info(
+                f'VEL sent: {linear_mm_s:+.0f} mm/s {angular_deg_s:+.0f} deg/s | wheels mm/s [{wheels}]',
+                throttle_duration_sec=1.0)
 
     def serial_read_timer(self) -> None:
         # Drain available bytes and dispatch each complete line. Non-blocking:
@@ -256,8 +268,21 @@ class SerialBridge(Node):
             telemetry = self.parse_telemetry(line)
             if telemetry is not None:
                 self.last_telemetry_monotonic = time.monotonic()
+                # Log e-stop / watchdog edges so a silently-dropped command
+                # stream is visible in the console, not just /diagnostics.
+                if telemetry.estop != self.estop_latched_reported:
+                    if telemetry.estop:
+                        self.get_logger().warning('Arduino reports E-STOP latched — all velocity commands suppressed until /base/clear_emergency_stop')
+                    else:
+                        self.get_logger().info('Arduino e-stop cleared')
+                if telemetry.watchdog != self.watchdog_reported:
+                    if telemetry.watchdog:
+                        self.get_logger().warning('Arduino watchdog stopped the motors (VEL command stream interrupted)')
+                    else:
+                        self.get_logger().info('Arduino watchdog released — motors accepting commands')
                 self.estop_latched_reported = telemetry.estop
                 self.watchdog_reported = telemetry.watchdog
+                self.last_wheel_speed_mm_s = telemetry.wheel_speed_mm_s
                 self.publish_telemetry(telemetry)
             return
 

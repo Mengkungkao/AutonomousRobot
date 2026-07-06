@@ -33,6 +33,9 @@ class CmdMux(Node):
         # Each source holds (last Twist, monotonic receive time); 0. means "never received".
         # 'blocked' is the latest verdict of the front-sector obstacle check.
         self.nav=(Twist(),0.); self.tele=(Twist(),0.); self.manual=(Twist(),0.); self.blocked=False
+        # Operational state kept for logging: nearest front range, scan arrival
+        # time, and the last source/blocked values so transitions log once.
+        self.nearest=float('inf'); self.last_scan_t=0.; self.last_source='(none yet)'
         # Arbitrated output consumed by the Arduino serial bridge.
         self.pub=self.create_publisher(Twist,'/cmd_vel_out',20)
         # Inputs: Nav2 on /cmd_vel (see module docstring), keyboard teleop,
@@ -54,20 +57,43 @@ class CmdMux(Node):
             a=m.angle_min+i*m.angle_increment
             # Only consider beams inside the front sector; skip inf/NaN returns.
             if abs(a)<=self.half and math.isfinite(r): nearest=min(nearest,r)
-        self.blocked=nearest<self.stop
+        self.nearest=nearest; self.last_scan_t=time.monotonic()
+        blocked=nearest<self.stop
+        if blocked!=self.blocked:
+            if blocked: self.get_logger().warning(f'FRONT STOP engaged: obstacle at {nearest:.2f} m < {self.stop:.2f} m — forward commands will be zeroed')
+            else: self.get_logger().info(f'front stop released: nearest front range {nearest:.2f} m')
+        self.blocked=blocked
 
     def tick(self):
         # Pick the highest-priority source that published within the timeout:
         # teleop first, then manual, then Nav2. If all are stale, output stays
         # a zero Twist, which stops the robot.
-        now=time.monotonic(); out=Twist()
+        now=time.monotonic(); out=Twist(); source='none (all stale)'
         for name in ('tele','manual','nav'):
             msg,t=getattr(self,name)
-            if now-t<=self.timeout: out=msg; break
+            if now-t<=self.timeout: out=msg; source=name; break
+        # Log once whenever the winning source changes, including falling back
+        # to zero because every source went stale mid-drive.
+        if source!=self.last_source:
+            self.get_logger().info(f'velocity source: {self.last_source} -> {source}')
+            self.last_source=source
         # Safety gate: while an obstacle is inside the stop distance, any command
         # with forward velocity is replaced by a full stop. Commands that only
         # reverse or rotate in place (linear.x <= 0) pass through unchanged.
-        if self.blocked and out.linear.x>0: out=Twist()
+        if self.blocked and out.linear.x>0:
+            self.get_logger().warning(
+                f'front stop gate zeroing {source} command lin={out.linear.x:.2f} (nearest {self.nearest:.2f} m)',
+                throttle_duration_sec=1.0)
+            out=Twist()
+        # The gate decides from LiDAR data; warn if that data stops flowing.
+        if self.last_scan_t and now-self.last_scan_t>1.0:
+            self.get_logger().warning(f'/scan stale for {now-self.last_scan_t:.1f} s — front stop gate using old data', throttle_duration_sec=2.0)
+        # 1 Hz heartbeat while anything nonzero is moving through the mux.
+        if abs(out.linear.x)>0.005 or abs(out.angular.z)>0.01:
+            self.get_logger().info(
+                f'mux: {source} lin={out.linear.x:+.2f} m/s ang={out.angular.z:+.2f} rad/s '
+                f'front={self.nearest:.2f} m blocked={self.blocked}',
+                throttle_duration_sec=1.0)
         self.pub.publish(out)
 
 def main(args=None):
