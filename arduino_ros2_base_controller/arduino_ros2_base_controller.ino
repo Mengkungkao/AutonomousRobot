@@ -130,10 +130,14 @@ const float FF_SLOPE_MM_S_PER_PWM_REV[MOTOR_COUNT] = {2.4662f, 2.1564f, 1.9853f,
 const float FF_INTERCEPT_MM_S_REV[MOTOR_COUNT] = {-118.32f, -86.97f, -92.43f, -104.95f};
 
 // MPU sign: a physical left turn must make ROS yaw increase (REP-103,
-// CCW-positive). This MPU reports clockwise-positive (hand left-turn test read
-// -50 deg), so the sign is flipped here. Set back to 1.0 only if a left-turn
-// test shows yaw decreasing again after a hardware change.
-const float IMU_YAW_SIGN = -1.0f;
+// CCW-positive). Measured live 2026-07-06 (teleop left turn, commanded
+// wz=+1.0, robot physically CCW): the published yaw rate came out NEGATIVE
+// with the old -1.0 sign here, meaning the raw getAngleZ/getGyroZ output is
+// already CCW-positive on this robot and needs no flip. The inverted yaw
+// mirrored every rotation in RViz and made SLAM fight the scans. If rotation
+// ever mirrors again, re-verify with nav_monitor's REVERSED ANGULAR check
+// before touching this.
+const float IMU_YAW_SIGN = 1.0f;
 
 // -----------------------------------------------------------------------------
 // Hardware
